@@ -277,3 +277,34 @@ The SCSI vendor string reported by the device is `Innostor`.
 
 要定位这一步,需要用 USBPcap 抓一次 Windows 上 AI Burn 烧录小 ISO 的
 USB 流量(过滤 `usb.idVendor == 0x1f75`),对比后即可补齐。
+
+## 10. 模式切换与恢复的实测记录
+
+### 观察到的三种枚举状态
+
+| 状态 | model | type | 节点 | 容量 | 可写 |
+|---|---|---|---|---|---|
+| CD-ROM | `CD-ROM on Flash` | 5 | `/dev/sr0` | 15728640 块 × 2048 | 否(见第 9 节) |
+| 大容量存储 | (空) | 0 | `/dev/sda` | 30 GB | 是 |
+| 裸片(下载模式) | `NAND Flash` | 0 | `/dev/sda` | **0** | 否 |
+
+### 触发条件
+
+- 「大容量存储」状态是在 ISO 区被破坏后出现的,属于**降级/回落**,
+  不是正常工作模式。写入一个合法 ISO 后设备会回到 CD-ROM。
+- 「裸片」状态是在介质已被弹出(`NOT READY / MEDIUM NOT PRESENT`)的
+  情况下再做 USB 去授权复位触发的。该状态下 `READ CAPACITY` 失败、
+  `WRITE(10)` 返回 `NOT READY`。
+- **物理拔插可以恢复**:裸片状态拔插后回到正常的 CD-ROM 模式,内容完好。
+
+### 不可用的手段
+
+| 手段 | 结果 |
+|---|---|
+| `START STOP UNIT` 弹/装介质 (0x1B) | ❌ `INVALID FIELD IN CDB` |
+| USB 去授权(`authorized` 0/1)复位 | ⚠️ 可让设备重新枚举,但可能落入裸片状态 |
+| `usb-storage` unbind/bind | ✅ 较温和,能可靠地重新枚举 |
+| 硬件写保护开关切换 | 不影响枚举模式(实测仍为 type 5) |
+
+**结论**:模式不是由主机命令主动切换的,而是固件根据内部状态(ISO 是否
+有效、是否处于异常)自行决定。主机侧能做的是温和地重新枚举设备。
