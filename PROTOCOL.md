@@ -226,3 +226,54 @@ In CD-ROM mode (SCSI type 5) the block device is read only and the vendor
 mass-storage mode is required.
 
 The SCSI vendor string reported by the device is `Innostor`.
+
+## 9. 光驱模式下的写入(实测记录)
+
+设备的 `WRITE(12)` / `READ(12)` 使用**非标准 CDB 布局**:
+
+```
+字节 0     : 0xAA (WRITE) / 0xA8 (READ)
+字节 1     : 0
+字节 2..5  : LBA,大端 32 位
+字节 6..9  : 必须为 0        ← 标准 WRITE(12) 的长度字段在这里,本设备忽略
+字节 10    : 传输块数(单字节,1..255)
+字节 11    : 0
+```
+
+用标准布局(长度写进 6..9)会得到 `INVALID FIELD IN CDB`(sense 05/20)。
+
+### 已知能工作 / 不能工作的部分
+
+| 操作 | 结果 |
+|---|---|
+| `READ(10)` (0x28) 读光盘内容 | ✅ |
+| `READ CAPACITY(10)` | ✅ 最后一块 LBA=15728639,块大小 2048 |
+| `WRITE(12)` (0xAA,长度在字节 10) | ✅ 被接受,0 错误 |
+| 写入后经 `READ(12)` 回读 | ✅ 一致(来自设备写缓存) |
+| **USB 重新枚举后回读** | ❌ 数据丢失,仍是旧内容 |
+| 写入后经 `READ(10)` 读光盘视图 | ❌ 仍是旧内容 |
+| `WRITE(10)` / `WRITE(16)` / `WRITE AND VERIFY` | ❌ `INVALID FIELD IN CDB` |
+| `SYNCHRONIZE CACHE` (0x35 / 0x91) | ❌ 不支持 |
+| `CLOSE TRACK/SESSION` (0x5B) | ❌ 不支持 |
+| `BLANK` (0xA1) | ❌ 不支持 |
+| `MODE SENSE` / `GET CONFIGURATION` | ❌ 不支持 |
+| `START STOP UNIT` (弹出/装载) | ❌ 不支持 |
+| `PREVENT ALLOW MEDIUM REMOVAL` | ✅ 接受,但不影响写入 |
+| 厂商 `P.M.` op 0x00/0x01/0x03 | ❌ `INVALID FIELD IN CDB` |
+| 厂商 `P.M.` op 0x07 / 0x08 / 0xFF | ✅ |
+| 认证(op8 取 2 字节 + opFF 回写 12 字节密钥) | ✅ 命令接受,但写仍不落盘 |
+
+### 地址空间
+
+`READ(12) LBA 0` 的内容等于 `READ(10) LBA 16`(ISO 的主卷描述符),
+说明两者寻址基准不同。但对 `WRITE(12)` 做同样假设测试并不成立。
+
+### 结论
+
+写入命令会被接受,但数据既不进入 `READ(10)` 的光盘视图,也无法在重新
+枚举后保留。AI Burn 在 Windows 上可以正常烧录(且不需要拔插),说明
+还缺一个"提交/重新挂载介质"的步骤,很可能由 Innostor 的过滤驱动或某个
+尚未识别的厂商命令完成。
+
+要定位这一步,需要用 USBPcap 抓一次 Windows 上 AI Burn 烧录小 ISO 的
+USB 流量(过滤 `usb.idVendor == 0x1f75`),对比后即可补齐。
