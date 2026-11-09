@@ -242,25 +242,17 @@ impl App {
                     "✘ 没有找到 Innostor IS903 设备。请插好设备,并确认已加载 sg 模块。",
                 );
             }
-            Some(d) if !d.is_writable() => {
-                ui.colored_label(
-                    egui::Color32::from_rgb(220, 160, 60),
-                    format!(
-                        "⚠ 该设备当前是{}。此模式只读,无法烧录 —— 需要它以大容量存储模式(类型 0)出现。",
-                        d.status_text()
-                    ),
-                );
-            }
             Some(d) => {
-                if !can_write(&d.node) {
+                // 只对可写的块设备做权限预检;光驱模式走 SG_IO,不需要 disk 组
+                if d.is_writable() && !can_write(&d.node) {
                     ui.colored_label(
                         egui::Color32::from_rgb(220, 160, 60),
-                        "⚠ 当前用户没有写权限。请把自己加入 disk 组(重新登录生效),或给设备加 ACL。",
+                        "⚠ 没有写权限。把自己加入 disk 组(重新登录生效)即可。",
                     );
                 } else {
                     ui.colored_label(
                         egui::Color32::from_rgb(90, 180, 110),
-                        "✔ 设备可写,准备就绪",
+                        "✔ 已就绪",
                     );
                 }
             }
@@ -431,10 +423,8 @@ impl App {
         );
         ui.add_space(6.0);
         ui.horizontal(|ui| {
-            let dev_ok = self
-                .current()
-                .map(|d| d.is_writable() && can_write(&d.node))
-                .unwrap_or(false);
+            // 只要识别到 IS903 就允许烧录;具体走哪条写入路径由后台决定
+            let dev_ok = self.current().is_some();
             let cap = self.current().map(|d| d.capacity).unwrap_or(0);
             let fits = cap == 0 || self.est_iso() <= cap;
             let ready = dev_ok && !self.sources.is_empty() && fits && !self.busy;
@@ -449,7 +439,7 @@ impl App {
                 ui.spinner();
                 ui.label("进行中…");
             } else if !dev_ok {
-                ui.weak("设备不可写,无法开始");
+                ui.weak("未检测到设备");
             } else if self.sources.is_empty() {
                 ui.weak("请先添加要烧录的内容");
             } else if !fits {

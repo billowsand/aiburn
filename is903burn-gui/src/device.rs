@@ -24,6 +24,7 @@ impl Device {
         self.scsi_type == 0
     }
 
+    #[allow(dead_code)]
     pub fn status_text(&self) -> String {
         if self.is_writable() {
             "可烧录".to_string()
@@ -40,7 +41,8 @@ impl Device {
         } else {
             String::new()
         };
-        format!("{}   —   {}{}", self.node.display(), self.status_text(), cap)
+        // 对用户只暴露节点和容量;模式细节由后台处理
+        format!("{}{}", self.node.display(), cap)
     }
 }
 
@@ -176,4 +178,19 @@ fn usb_interface_of(block_name: &str) -> Result<String, String> {
         cur = parent;
     }
     Err("找不到对应的 usb-storage 接口".into())
+}
+
+/// 找到块设备对应的 /dev/sgN 节点
+pub fn sg_node_of(block_name: &str) -> Option<String> {
+    let target = std::fs::canonicalize(format!("/sys/block/{block_name}/device")).ok()?;
+    let dir = std::fs::read_dir("/sys/class/scsi_generic").ok()?;
+    for e in dir.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        if let Ok(p) = std::fs::canonicalize(e.path().join("device")) {
+            if p == target {
+                return Some(format!("/dev/{name}"));
+            }
+        }
+    }
+    None
 }

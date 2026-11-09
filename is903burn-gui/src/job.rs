@@ -84,7 +84,23 @@ pub fn run(
         logp!("已卸载");
     }
 
-    // ---- 2. 生成 ISO
+    // ---- 2. 判断可写路径
+    let blk_name = blk
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let dev = device::scan().into_iter().find(|d| d.name == blk_name);
+    let use_sg = match &dev {
+        Some(d) => !d.is_writable(),
+        None => false,
+    };
+    if use_sg {
+        logp!("设备为光驱模式,使用 SG_IO 写入");
+    } else {
+        logp!("设备为可写块设备,直接写入");
+    }
+
+    // ---- 3. 生成 ISO
     prog!("生成 ISO 镜像", 0.02);
     let tmp = std::env::temp_dir().join(format!(
         "is903burn-{}-{}.iso",
@@ -151,7 +167,10 @@ pub fn run(
 
     prog!("写入设备", 0.45);
     logp!("开始写入 {} …", device::human_size(iso_len));
-    {
+    if use_sg {
+        let logger = |line: String| logp!("{line}");
+        write_via_sg(blk, &blk_name, &tmp, iso_len, &logger)?;
+    } else {
         let tx2 = tx.clone();
         let ctx2 = ctx.cloned();
         let mut last = 0.0f32;
@@ -171,7 +190,7 @@ pub fn run(
             }
         })?;
     }
-    logp!("写入完成并已 fsync");
+    logp!("写入完成");
 
     // ---- 4. 刷内核缓存
     prog!("刷新内核缓存", 0.76);
@@ -305,4 +324,81 @@ pub fn run(
         secs: 0.0,
         file_check,
     })
+}
+
+/// 通过 SG_IO 写入光驱类设备(IS903 自定义 WRITE(12) 布局)
+fn write_via_sg(
+    blk: &std::path::Path,
+    blk_name: &str,
+    iso: &std::path::Path,
+    iso_len: u64,
+    logp: &dyn Fn(String),
+) -> anyhow::Result<()> {
+    use std::io::Read;
+    let sg_path = device::sg_node_of(blk_name)
+        .ok_or_else(|| anyhow::anyhow!("找不到 {} 的 /dev/sgN 节点", blk.display()))?;
+    logp(format!("打开 {sg_path}"));
+    let sg = crate::sg::Sg::open(std::path::Path::new(&sg_path))?;
+    let (last, bs) = sg.capacity()?;
+    logp(format!(
+        "设备容量: 最后一块 LBA={last}, 块大小={bs} 字节"
+    ));
+
+    let total_blocks = (iso_len as usize).div_ceil(crate::sg::BLK);
+    logp(format!("需要写入 {total_blocks} 块(每块 {} 字节)", crate::sg::BLK));
+
+    let mut f = std::fs::File::open(iso)?;
+    let mut buf = vec![0u8; 255 * crate::sg::BLK];
+    let mut lba = 0u32;
+    while (lba as usize) < total_blocks {
+        let n = ((total_blocks - lba as usize).min(255)) as usize;
+        let want = n * crate::sg::BLK;
+        buf[..want].fill(0);
+        f.read_exact(&mut buf[0..want])
+            .or_else(|e| if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                // 末块不足则读剩余,其余补零
+                Ok::<_, std::io::Error>(()) 
+            } else { Err(e) })?;
+        sg.write12(lba, &mut buf[..want])
+            .map_err(|e| anyhow::anyhow!("LBA {lba} 写入失败: {e}"))?;
+        lba += n as u32;
+    }
+    logp(format!("已下发 {lba} 块"));
+
+    // 用 READ(10) 回读「光盘」可见内容做核对
+    let mut back = vec![0u8; crate::sg::BLK];
+    let mut bad = 0;
+    for probe in [0u32, 16, 32] {
+        let mut orig = vec![0u8; crate::sg::BLK];
+        use std::io::{Seek, SeekFrom};
+        let mut f2 = std::fs::File::open(iso)?;
+        let off = probe as u64 * crate::sg::BLK as u64;
+        if off + crate::sg::BLK as u64 > iso_len {
+            continue;
+        }
+        f2.seek(SeekFrom::Start(off))?;
+        f2.read_exact(&mut orig)?;
+        match sg.read10(probe, &mut back) {
+            Ok(()) => {
+                if back != orig {
+                    bad += 1;
+                    logp(format!("⚠ 回读 LBA {probe} 与源不一致"));
+                } else {
+                    logp(format!("回读 LBA {probe} 一致"));
+                }
+            }
+            Err(e) => {
+                bad += 1;
+                logp(format!("⚠ 回读 LBA {probe} 失败: {e}"));
+            }
+        }
+    }
+    if bad > 0 {
+        anyhow::bail!(
+            "写入未被设备接受({bad} 个抽样块回读不一致)。\n\
+             该固件在光驱模式下拒绝持久化写入,需要先用量产工具把设备\
+             重新开卡为可写配置。"
+        );
+    }
+    Ok(())
 }

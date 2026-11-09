@@ -9,6 +9,7 @@ mod device;
 mod iso;
 mod job;
 mod mount;
+mod sg;
 
 fn main() -> eframe::Result<()> {
     // 无参数时走命令行自检,方便脱离界面验证 ISO 生成
