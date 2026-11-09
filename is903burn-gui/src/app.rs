@@ -157,6 +157,15 @@ impl App {
                     if let Some(mp) = &ok.mount_point {
                         self.push_log(format!("✔ 已挂载:{}", mp.display()));
                     }
+                    if let Some((n, probs)) = &ok.file_check {
+                        if probs.is_empty() {
+                            self.stage = "烧录成功(已核对)".into();
+                        } else {
+                            self.stage = "烧录完成,但有文件不一致".into();
+                            self.push_log(format!("⚠ {} 个文件不一致", probs.len()));
+                        }
+                        self.push_log(format!("✔ 文件核对: {n} 个文件内容一致"));
+                    }
                     self.last_ok = Some(ok);
                 }
                 Err(e) => {
@@ -221,6 +230,28 @@ impl App {
                     self.sel = 0;
                 }
                 self.last_scan = Instant::now();
+            }
+            // 软件复位 USB:让设备重新枚举,效果等同拔插但不用动手
+            let can_reset = !self.busy && self.current().is_some();
+            if ui
+                .add_enabled(can_reset, egui::Button::new("USB 软复位"))
+                .on_hover_text("让设备重新枚举(需要 root 权限;不需要物理拔插)")
+                .clicked()
+            {
+                if let Some(d) = self.current() {
+                    let name = d.name.clone();
+                    self.push_log(format!("尝试软复位 {name} …"));
+                    match device::usb_soft_reset(&name) {
+                        Ok(id) => {
+                            self.push_log(format!("✔ 已复位 USB 设备 {id},重新扫描"));
+                            std::thread::sleep(Duration::from_millis(500));
+                            self.devices = device::scan();
+                            self.sel = 0;
+                            self.last_scan = Instant::now();
+                        }
+                        Err(e) => self.push_log(format!("✘ 软复位失败:{e}")),
+                    }
+                }
             }
         });
 

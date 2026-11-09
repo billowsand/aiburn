@@ -21,6 +21,8 @@ pub struct JobOk {
     pub files: usize,
     pub dirs: usize,
     pub secs: f64,
+    /// 挂载后逐文件核对的结果;(None = 未能核对)
+    pub file_check: Option<(usize, Vec<String>)>,
 }
 
 pub struct Job {
@@ -218,6 +220,33 @@ pub fn run(
         }
     };
 
+    // ---- 7. 文件级核对(内容多重集合比对)
+    let mut file_check: Option<(usize, Vec<String>)> = None;
+    if let Some(mp) = &mp {
+        prog!("核对文件内容", 0.985);
+        logp!("核对挂载后的文件内容(按大小+哈希比对)…");
+        match (burn::hash_tree(sources), burn::hash_tree(&[mp.clone()])) {
+            (Ok(a), Ok(b)) => {
+                let (matched, problems) = burn::compare_sets(&a, &b);
+                if problems.is_empty() && a.len() == b.len() {
+                    logp!("✔ 文件核对通过:{} 个文件全部一致", a.len());
+                } else {
+                    logp!(
+                        "⚠ 文件核对:{} 个一致,源 {} 个 / 盘上 {} 个",
+                        matched,
+                        a.len(),
+                        b.len()
+                    );
+                    for p in &problems {
+                        logp!("   {p}");
+                    }
+                }
+                file_check = Some((matched, problems));
+            }
+            (Err(e), _) | (_, Err(e)) => logp!("⚠ 无法完成文件核对: {e}"),
+        }
+    }
+
     prog!("完成", 1.0);
     let _ = std::fs::remove_file(&tmp);
     logp!("临时 ISO 已清理");
@@ -229,5 +258,6 @@ pub fn run(
         files: summary.files,
         dirs: summary.dirs,
         secs: 0.0,
+        file_check,
     })
 }

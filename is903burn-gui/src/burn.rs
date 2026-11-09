@@ -193,3 +193,77 @@ pub fn estimate_iso_size(data_bytes: u64, entries: u64) -> u64 {
     let with_ratio = base + base / 100 * 1;
     (with_ratio + 2047) / 2048 * 2048
 }
+
+/// 递归收集一组路径下所有文件的 (大小, SHA-256)。
+///
+/// 用来做「内容级」核对:不比较文件名,只比较每份内容的哈希多重集合。
+/// 这样即使 Joliet 截断了长文件名,也不会误判。
+pub fn hash_tree(paths: &[std::path::PathBuf]) -> Result<Vec<(u64, String)>> {
+    let mut out = Vec::new();
+    for p in paths {
+        hash_walk(p, &mut out)?;
+    }
+    out.sort();
+    Ok(out)
+}
+
+fn hash_walk(p: &Path, out: &mut Vec<(u64, String)>) -> Result<()> {
+    let meta = match std::fs::symlink_metadata(p) {
+        Ok(m) => m,
+        Err(_) => return Ok(()),
+    };
+    if meta.is_dir() {
+        let mut entries: Vec<_> = std::fs::read_dir(p)?.flatten().collect();
+        entries.sort_by_key(|e| e.file_name());
+        for e in entries {
+            hash_walk(&e.path(), out)?;
+        }
+    } else if meta.is_file() {
+        let h = sha256_file(p)?;
+        out.push((meta.len(), hex(&h)));
+    }
+    Ok(())
+}
+
+fn hex(b: &[u8]) -> String {
+    let mut s = String::with_capacity(b.len() * 2);
+    for x in b {
+        s.push_str(&format!("{x:02x}"));
+    }
+    s
+}
+
+/// 核对两个文件集合是否完全一致(按 大小+哈希 的多重集合比较)
+pub fn compare_sets(
+    src: &[(u64, String)],
+    dst: &[(u64, String)],
+) -> (usize, Vec<String>) {
+    let mut problems = Vec::new();
+    let mut a = src.to_vec();
+    let mut b = dst.to_vec();
+    a.sort();
+    b.sort();
+
+    // 多出来的(源里有、盘上没有)
+    let mut bi = 0usize;
+    for item in &a {
+        while bi < b.len() && b[bi] < *item {
+            bi += 1;
+        }
+        if bi < b.len() && b[bi] == *item {
+            bi += 1;
+            continue;
+        }
+        problems.push(format!(
+            "缺少或内容不符:{} 字节,哈希 {}…",
+            item.0,
+            &item.1[..12.min(item.1.len())]
+        ));
+        if problems.len() >= 8 {
+            break;
+        }
+    }
+
+    let matched = src.len().min(dst.len()).saturating_sub(problems.len());
+    (matched, problems)
+}

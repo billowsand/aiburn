@@ -113,7 +113,7 @@ pub fn scan() -> Vec<Device> {
 }
 
 /// 软件复位 USB 设备,替代物理拔插。
-#[allow(dead_code)]
+
 ///
 /// 通过 /sys/bus/usb/devices/<id>/authorized 触发重新枚举。
 /// 需要写权限(通常要 root);失败时返回错误说明。
@@ -139,9 +139,21 @@ pub fn usb_soft_reset(block_name: &str) -> Result<String, String> {
     let id = usb_id.ok_or_else(|| "找不到对应的 USB 设备节点".to_string())?;
 
     let auth = format!("/sys/bus/usb/devices/{id}/authorized");
-    fs::write(&auth, "0").map_err(|e| format!("写 {auth} 失败(需要 root): {e}"))?;
-    std::thread::sleep(std::time::Duration::from_millis(800));
-    fs::write(&auth, "1").map_err(|e| format!("写 {auth} 失败(需要 root): {e}"))?;
+
+    // 先直接写;没权限就走 pkexec 提权
+    if fs::write(&auth, "0").is_ok() {
+        std::thread::sleep(std::time::Duration::from_millis(800));
+        fs::write(&auth, "1").map_err(|e| format!("恢复 {auth} 失败: {e}"))?;
+    } else {
+        let script = format!("echo 0 > {auth}; sleep 0.8; echo 1 > {auth}");
+        let st = std::process::Command::new("pkexec")
+            .args(["sh", "-c", &script])
+            .status()
+            .map_err(|e| format!("无法调用 pkexec: {e}"))?;
+        if !st.success() {
+            return Err("软复位需要 root 权限,授权被取消或失败".to_string());
+        }
+    }
     std::thread::sleep(std::time::Duration::from_millis(1200));
     Ok(id)
 }
