@@ -12,3 +12,6 @@ tests/mock_is903.so
 # 第三方二进制与测试素材(不入库)
 AIBurn.exe
 Aahj.ttf
+
+# Rust GUI
+/is903burn-gui/target

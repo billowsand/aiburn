@@ -1,0 +1,16 @@
+[package]
+name = "is903burn-gui"
+version = "0.1.0"
+edition = "2021"
+description = "IS903 (UFCD) 烧录工具 — 图形界面"
+
+[dependencies]
+eframe = "0.37"
+rfd = "0.15"
+sha2 = "0.10"
+libc = "0.2"
+anyhow = "1"
+
+[profile.release]
+opt-level = 2
+strip = true
