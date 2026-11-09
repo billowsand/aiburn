@@ -1,0 +1,14 @@
+# 编译产物
+/is903burn
+*.o
+*.so
+
+# 生成的镜像与临时文件
+*.iso
+*.img
+*.bin
+tests/mock_is903.so
+
+# 第三方二进制与测试素材(不入库)
+AIBurn.exe
+Aahj.ttf
