@@ -208,14 +208,14 @@ pub fn run(
     logp!("校验通过:设备内容与 ISO 逐字节一致");
 
     // ---- 6. 挂载
-    prog!("挂载设备", 0.97);
-    let mp = match mount::mount(blk) {
+    prog!("挂载设备", 0.96);
+    let mut mp = match mount::mount(blk) {
         Ok(p) => {
             logp!("已挂载到 {}", p.display());
             Some(p)
         }
         Err(e) => {
-            logp!("挂载失败(不影响烧录结果): {e}");
+            logp!("挂载失败,稍后尝试重新枚举设备: {e}");
             None
         }
     };
@@ -244,6 +244,51 @@ pub fn run(
                 file_check = Some((matched, problems));
             }
             (Err(e), _) | (_, Err(e)) => logp!("⚠ 无法完成文件核对: {e}"),
+        }
+    }
+
+    // ---- 8. 必要时重新枚举设备再核对一次
+    //
+    // 设备内部可能缓存着旧镜像,导致挂载/读取到旧内容。这时对 usb-storage
+    // 接口做一次 unbind/bind,让固件重新读取闪存,再挂载核对。
+    let need_refresh = match &file_check {
+        Some((_, probs)) => !probs.is_empty() || mp.is_none(),
+        None => mp.is_none(),
+    };
+    if need_refresh {
+        let name = blk
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        logp!("检测到内容可能未刷新,正在重新枚举设备(无需拔插)…");
+        match device::reenumerate(&name, std::time::Duration::from_secs(15)) {
+            Ok(nd) => {
+                logp!("设备已重新枚举为 {}", nd.node.display());
+                // 新节点可能变成 CD-ROM(/dev/srN)
+                if let Ok(p) = mount::mount(&nd.node) {
+                    logp!("已挂载到 {}", p.display());
+                    mp = Some(p.clone());
+                    // 重新核对
+                    match (burn::hash_tree(sources), burn::hash_tree(&[p])) {
+                        (Ok(a), Ok(b)) => {
+                            let (matched, problems) = burn::compare_sets(&a, &b);
+                            if problems.is_empty() && a.len() == b.len() {
+                                logp!("✔ 重新枚举后文件核对通过:{} 个文件全部一致", a.len());
+                            } else {
+                                logp!("⚠ 重新枚举后仍有 {} 个文件不一致", problems.len());
+                                for x in &problems {
+                                    logp!("   {x}");
+                                }
+                            }
+                            file_check = Some((matched, problems));
+                        }
+                        _ => logp!("⚠ 重新枚举后无法完成文件核对"),
+                    }
+                } else {
+                    logp!("⚠ 重新枚举后挂载失败(烧录本身已完成)");
+                }
+            }
+            Err(e) => logp!("⚠ 重新枚举失败:{e}(可手动拔插后查看)"),
         }
     }
 

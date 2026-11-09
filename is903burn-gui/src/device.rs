@@ -112,48 +112,68 @@ pub fn scan() -> Vec<Device> {
     out
 }
 
-/// 软件复位 USB 设备,替代物理拔插。
-
+/// 让设备重新枚举:对 usb-storage 接口做 unbind/bind。
 ///
-/// 通过 /sys/bus/usb/devices/<id>/authorized 触发重新枚举。
-/// 需要写权限(通常要 root);失败时返回错误说明。
-pub fn usb_soft_reset(block_name: &str) -> Result<String, String> {
-    // /sys/block/sda → 找到对应的 USB 设备目录
-    let link = format!("/sys/block/{block_name}");
-    let real = fs::canonicalize(&link).map_err(|e| format!("无法解析 {link}: {e}"))?;
+/// 比取消 USB 授权(authorized 0/1)温和,不会让设备彻底掉线。
+/// 需要 root;无权限时自动走 pkexec。
+///
+/// 返回重新枚举后找到的设备(可能换了节点名,例如 /dev/sda → /dev/sr0)。
+pub fn reenumerate(block_name: &str, timeout: std::time::Duration) -> Result<Device, String> {
+    let iface = usb_interface_of(block_name)?;
 
-    // 向上找形如 "2-1" 的 USB 设备目录
-    let mut cur = real.as_path();
-    let mut usb_id = None;
-    while let Some(parent) = cur.parent() {
-        if let Some(n) = cur.file_name().and_then(|s| s.to_str()) {
-            if n.contains('-') && n.chars().next().is_some_and(|c| c.is_ascii_digit()) {
-                if cur.join("authorized").exists() {
-                    usb_id = Some(n.to_string());
-                    break;
-                }
-            }
-        }
-        cur = parent;
-    }
-    let id = usb_id.ok_or_else(|| "找不到对应的 USB 设备节点".to_string())?;
-
-    let auth = format!("/sys/bus/usb/devices/{id}/authorized");
-
-    // 先直接写;没权限就走 pkexec 提权
-    if fs::write(&auth, "0").is_ok() {
-        std::thread::sleep(std::time::Duration::from_millis(800));
-        fs::write(&auth, "1").map_err(|e| format!("恢复 {auth} 失败: {e}"))?;
+    // 先试直接写;不行再 pkexec
+    let direct = std::fs::write(
+        format!("/sys/bus/usb/drivers/usb-storage/unbind"),
+        &iface,
+    )
+    .is_ok();
+    if direct {
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        let _ = std::fs::write(
+            format!("/sys/bus/usb/drivers/usb-storage/bind"),
+            &iface,
+        );
     } else {
-        let script = format!("echo 0 > {auth}; sleep 0.8; echo 1 > {auth}");
+        let script = format!(
+            "echo -n '{iface}' > /sys/bus/usb/drivers/usb-storage/unbind; \
+             sleep 0.4; \
+             echo -n '{iface}' > /sys/bus/usb/drivers/usb-storage/bind"
+        );
         let st = std::process::Command::new("pkexec")
             .args(["sh", "-c", &script])
             .status()
             .map_err(|e| format!("无法调用 pkexec: {e}"))?;
         if !st.success() {
-            return Err("软复位需要 root 权限,授权被取消或失败".to_string());
+            return Err("重新枚举需要 root 权限,授权被取消".into());
         }
     }
-    std::thread::sleep(std::time::Duration::from_millis(1200));
-    Ok(id)
+
+    // 等待设备重新出现
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        if let Some(d) = scan().into_iter().next() {
+            return Ok(d);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err("重新枚举后设备未在规定时间内出现".into());
+        }
+    }
+}
+
+/// 找到块设备对应的 usb-storage 接口名,例如 "2-1:1.0"
+fn usb_interface_of(block_name: &str) -> Result<String, String> {
+    let real = std::fs::canonicalize(format!("/sys/block/{block_name}"))
+        .map_err(|e| format!("无法解析 /sys/block/{block_name}: {e}"))?;
+    let mut cur = real.as_path();
+    while let Some(parent) = cur.parent() {
+        if let Some(n) = cur.file_name().and_then(|s| s.to_str()) {
+            // 接口目录形如 "2-1:1.0"
+            if n.contains('-') && n.contains(':') {
+                return Ok(n.to_string());
+            }
+        }
+        cur = parent;
+    }
+    Err("找不到对应的 usb-storage 接口".into())
 }
