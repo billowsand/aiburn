@@ -85,6 +85,9 @@ impl App {
     }
 
     fn est_iso(&self) -> u64 {
+        if self.sources.is_empty() {
+            return 0;
+        }
         burn::estimate_iso_size(self.data_bytes(), self.entry_count())
     }
 

@@ -40,7 +40,7 @@ impl Device {
         } else {
             String::new()
         };
-        format!("{}  ·  {}{}", self.node.display(), self.status_text(), cap)
+        format!("{}   —   {}{}", self.node.display(), self.status_text(), cap)
     }
 }
 

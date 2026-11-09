@@ -5,6 +5,30 @@ Innostar IS903 "USB Flash CD-ROM" (UFCD) chip using vendor SCSI commands.
 `is903burn` is a native Linux reimplementation of that protocol, speaking
 `SG_IO` directly to `/dev/sg0`.
 
+**图形界面(推荐)**
+
+`is903burn-gui/` 是基于已验证块设备路径的 Rust + egui 桌面程序:
+
+```sh
+cd is903burn-gui
+cargo build --release
+./target/release/is903burn-gui
+```
+
+功能:自动检测 IS903 设备(下拉框选择,只读模式会提示原因)、导入文件/文件夹、
+实时空间计算与超容拦截、后台烧录进度、O_DIRECT 回读校验、烧完自动挂载。
+
+ISO 由程序内部纯 Rust 生成(ISO 9660 + Joliet,支持中文文件名),不依赖
+`xorrisofs` 等外部工具。
+
+命令行自检:
+
+```sh
+./target/release/is903burn-gui --devices                    # 列出设备
+./target/release/is903burn-gui --mkiso <来源…> -l L -o F    # 只生成 ISO
+./target/release/is903burn-gui --burn <块设备> -l L <来源…> # 无界面烧录
+```
+
 **Documentation**
 
 * [使用流程.md](使用流程.md) — 完整操作手册(中文):环境准备、设备确认、
