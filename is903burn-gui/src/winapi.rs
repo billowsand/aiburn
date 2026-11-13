@@ -188,16 +188,16 @@ impl Raw {
             )
         };
         if handle as isize == -1 {
-            bail!(
-                "无法打开 {}（GetLastError={}）{}",
-                path,
-                last_error(),
-                if write {
-                    "，请检查设备是否已插入"
-                } else {
-                    ""
+            let code = last_error();
+            let hint = match (code, write) {
+                (5, true) => {
+                    "：拒绝访问。设备可能被安全软件限制，或所在目录／进程的完整性级别过低"
                 }
-            );
+                (5, false) => "：拒绝访问",
+                (_, true) => "，请检查设备是否已插入",
+                _ => "",
+            };
+            bail!("无法打开 {}（GetLastError={code}）{hint}", path);
         }
         Ok(Self { handle })
     }

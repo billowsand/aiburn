@@ -149,3 +149,19 @@ powershell -ExecutionPolicy Bypass -File .\is903burn-gui\build-windows.ps1
 .\is903burn-gui\target\release\is903burn-gui.exe --devices
 .\is903burn-gui\target\release\is903burn-gui.exe --burn D: -l LABEL .\data
 ```
+
+## 6. 故障排查：程序显示「容量为 0」
+
+如果 `--devices` 或界面里容量是 `0 B`，而设备明明插着，先看是不是
+**程序所在目录的完整性级别**被降低了。从带 Low 完整性标签的目录启动的
+程序会以 Low IL 运行，而 `\\.\D:` 是 Medium，写句柄会被直接拒绝
+（`GetLastError=5`），扫描只能退化成只读句柄，于是读不到容量。
+
+```cmd
+icacls .                     :: 看目录是否有 "Mandatory Label\Low Mandatory Level"
+icacls . /setintegritylevel (OI)(CI)M
+icacls . /T /C /Q /setintegritylevel (OI)(CI)M
+```
+
+修复后重新启动程序即可（也可把整个目录拷到 `%TEMP%` 下试运行以验证）。
+程序现在会把这种情况提示为“拒绝访问：……完整性级别过低”。
