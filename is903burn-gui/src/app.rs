@@ -1,7 +1,7 @@
 use crate::device::{self, Device};
 use crate::job::{self, Job, Msg};
 use eframe::egui::{
-    self, Align, Align2, Color32, FontId, Layout, RichText, Stroke, StrokeKind, Vec2,
+    self, Align, Align2, Color32, CornerRadius, FontId, Layout, RichText, Stroke, StrokeKind, Vec2,
 };
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -10,8 +10,79 @@ use std::time::{Duration, Instant};
 const SCAN_INTERVAL: Duration = Duration::from_secs(5);
 /// 统计来源时最多遍历的条目数，超过就显示「以上」
 const SCAN_LIMIT: usize = 20_000;
-/// 表示成功的绿色(仅用于「完成」状态)
-const OK: Color32 = Color32::from_rgb(120, 200, 140);
+/// 成功状态用的绿色(只用于「已完成」)
+const OK: Color32 = Color32::from_rgb(0x2E, 0x7D, 0x4F);
+
+// ------------------------------------------------------------------ 配色
+
+/// 正文：深棕，而不是纯黑
+const INK: Color32 = Color32::from_rgb(0x3A, 0x2C, 0x20);
+/// 强调色：棕
+const BROWN: Color32 = Color32::from_rgb(0x8B, 0x5E, 0x3C);
+/// 分隔线与描边
+const LINE: Color32 = Color32::from_rgb(0xDD, 0xD0, 0xC3);
+/// 面板里比白稍暗的底
+const SURFACE: Color32 = Color32::from_rgb(0xFA, 0xF6, 0xF2);
+/// 可交互控件默认底色
+const CONTROL: Color32 = Color32::from_rgb(0xF4, 0xEE, 0xE8);
+
+/// 固定白底 + 棕色强调色，不跟随系统深色模式（标题栏也跟着用浅色）
+fn apply_style(ctx: &egui::Context) {
+    // 只设 theme_preference 不够：首帧还来不及同步，标题栏会停在系统的深色，
+    // 所以再显式发一次 SetTheme（Windows 上会切回浅色标题栏）。
+    ctx.set_theme(egui::ThemePreference::Light);
+    ctx.send_viewport_cmd(egui::ViewportCommand::SetTheme(egui::SystemTheme::Light));
+    let mut v = egui::Visuals::light();
+    v.dark_mode = false;
+    v.panel_fill = Color32::WHITE;
+    v.window_fill = Color32::WHITE;
+    v.extreme_bg_color = SURFACE;
+    v.text_edit_bg_color = Some(Color32::WHITE);
+    v.faint_bg_color = CONTROL;
+    v.override_text_color = Some(INK);
+    v.weak_text_color = Some(Color32::from_rgb(0x83, 0x6D, 0x5A));
+    v.hyperlink_color = BROWN;
+    v.warn_fg_color = Color32::from_rgb(0xA8, 0x60, 0x0C);
+    v.error_fg_color = Color32::from_rgb(0xB0, 0x33, 0x25);
+    v.window_stroke = Stroke::new(1.0, LINE);
+    v.selection = egui::style::Selection {
+        bg_fill: Color32::from_rgb(0xEF, 0xE4, 0xD8),
+        stroke: Stroke::new(1.0, BROWN),
+    };
+
+    let w = &mut v.widgets;
+    w.noninteractive.bg_fill = SURFACE;
+    w.noninteractive.weak_bg_fill = SURFACE;
+    w.noninteractive.bg_stroke = Stroke::new(1.0, LINE);
+    w.noninteractive.fg_stroke = Stroke::new(1.0, INK);
+    w.noninteractive.corner_radius = CornerRadius::same(4);
+
+    w.inactive.bg_fill = CONTROL;
+    w.inactive.weak_bg_fill = CONTROL;
+    w.inactive.bg_stroke = Stroke::new(1.0, LINE);
+    w.inactive.fg_stroke = Stroke::new(1.0, INK);
+    w.inactive.corner_radius = CornerRadius::same(4);
+
+    w.hovered.bg_fill = Color32::from_rgb(0xEA, 0xDF, 0xD3);
+    w.hovered.weak_bg_fill = Color32::from_rgb(0xEA, 0xDF, 0xD3);
+    w.hovered.bg_stroke = Stroke::new(1.0, BROWN);
+    w.hovered.fg_stroke = Stroke::new(1.0, INK);
+    w.hovered.corner_radius = CornerRadius::same(4);
+
+    w.active.bg_fill = Color32::from_rgb(0xDF, 0xCF, 0xBE);
+    w.active.weak_bg_fill = Color32::from_rgb(0xDF, 0xCF, 0xBE);
+    w.active.bg_stroke = Stroke::new(1.0, BROWN);
+    w.active.fg_stroke = Stroke::new(1.0, INK);
+    w.active.corner_radius = CornerRadius::same(4);
+
+    w.open.bg_fill = Color32::from_rgb(0xEF, 0xE4, 0xD8);
+    w.open.weak_bg_fill = Color32::from_rgb(0xEF, 0xE4, 0xD8);
+    w.open.bg_stroke = Stroke::new(1.0, BROWN);
+    w.open.fg_stroke = Stroke::new(1.0, INK);
+    w.open.corner_radius = CornerRadius::same(4);
+
+    ctx.set_visuals(v);
+}
 
 /// 一项待烧录来源
 struct Source {
@@ -117,6 +188,7 @@ pub struct App {
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, initial: Vec<PathBuf>) -> Self {
+        apply_style(&cc.egui_ctx);
         install_fonts(&cc.egui_ctx);
         let mut app = Self {
             devices: Vec::new(),
@@ -424,7 +496,7 @@ impl App {
             });
 
             let list_height = (ui.available_height() - 26.0).max(56.0);
-            let bg = ui.visuals().extreme_bg_color;
+            let bg = Color32::WHITE;
             let weak = ui.visuals().weak_text_color();
             let accent = ui.visuals().selection.stroke.color;
 
@@ -603,13 +675,14 @@ impl App {
                 ui.add(
                     egui::ProgressBar::new(self.progress)
                         .desired_height(10.0)
+                        .fill(BROWN)
                         .corner_radius(2.0),
                 );
             } else if let Some(result) = &self.result {
                 match result {
                     Ok(ok) => {
                         ui.horizontal(|ui| {
-                            ui.label(RichText::new("✓ 烧录完成").strong().color(OK));
+                            ui.label(RichText::new("烧录完成").strong().color(OK));
                             ui.label(
                                 RichText::new(format!(
                                     "{} 个文件 · {} · {:.1} 秒",
@@ -629,7 +702,7 @@ impl App {
                             ui.add(
                                 egui::Label::new(
                                     RichText::new(format!(
-                                        "⚠ {} 个文件名超过 64 个字符，已在光盘上截断（详见「查看详情」）",
+                                        "注意：{} 个文件名超过 64 个字符，已在光盘上截断（详见「查看详情」）",
                                         ok.warnings.len()
                                     ))
                                     .color(ui.visuals().warn_fg_color),
@@ -647,7 +720,7 @@ impl App {
                         };
                         ui.horizontal(|ui| {
                             ui.label(
-                                RichText::new(if cancelled { "已取消" } else { "✕ 烧录失败" })
+                                RichText::new(if cancelled { "已取消" } else { "烧录失败" })
                                     .strong()
                                     .color(color),
                             );
@@ -664,7 +737,7 @@ impl App {
             if let Some(notice) = &self.notice {
                 ui.add(
                     egui::Label::new(
-                        RichText::new(format!("⚠ {notice}"))
+                        RichText::new(format!("注意：{notice}"))
                             .color(ui.visuals().warn_fg_color),
                     )
                     .truncate(),
@@ -833,6 +906,11 @@ impl App {
 }
 
 impl eframe::App for App {
+    /// 白底：透明处和窗口缩放时不会露出深色默认底色
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        Color32::WHITE.to_normalized_gamma_f32()
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.poll_job(&ctx);
@@ -879,7 +957,9 @@ impl eframe::App for App {
         }
 
         let margin = egui::Margin::symmetric(10, 8);
-        let panel = egui::Frame::new().inner_margin(margin);
+        let panel = egui::Frame::new()
+            .fill(Color32::WHITE)
+            .inner_margin(margin);
         egui::Panel::top("header")
             .resizable(false)
             .frame(panel)
@@ -893,7 +973,7 @@ impl eframe::App for App {
             .frame(panel)
             .show(ui, |ui| self.footer_ui(ui));
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().inner_margin(margin))
+            .frame(egui::Frame::new().fill(Color32::WHITE).inner_margin(margin))
             .show(ui, |ui| self.sources_ui(ui));
 
         self.confirm_ui(&ctx);
@@ -917,7 +997,7 @@ fn source_row(ui: &mut egui::Ui, source: &Source) -> bool {
         );
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             remove = ui
-                .add(egui::Button::new("✕").frame(false))
+                .add(egui::Button::new("×").frame(false))
                 .on_hover_text("从列表移除")
                 .clicked();
             ui.label(

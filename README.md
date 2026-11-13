@@ -28,7 +28,7 @@ Innostar IS903 "USB Flash CD-ROM" (UFCD) chip using vendor SCSI commands.
 
 ### 图形界面
 
-界面用 egui 默认样式，没有自绘皮肤和配色：顶部是设备，中间是烧录内容，底部是卷标和主按钮。
+界面固定浅色配色（白底 + 棕色强调，不跟随系统深色）：顶部是设备，中间是烧录内容，底部是卷标和主按钮。
 
 ![图形界面](is903burn-gui/screenshots/main.png)
 
