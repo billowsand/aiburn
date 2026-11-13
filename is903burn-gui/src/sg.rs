@@ -5,6 +5,8 @@ use std::fs::File;
 #[cfg(target_os = "linux")]
 use std::fs::OpenOptions;
 use std::io::Read;
+#[cfg(not(target_os = "macos"))]
+use std::io::Write;
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
 use std::path::Path;
@@ -18,6 +20,8 @@ pub struct Sg {
     file: File,
     #[cfg(target_os = "macos")]
     usb: Option<std::ptr::NonNull<libc::c_void>>,
+    #[cfg(target_os = "windows")]
+    raw: crate::winapi::Raw,
 }
 
 #[cfg(target_os = "linux")]
@@ -50,8 +54,8 @@ struct SgIoHdr {
 
 #[cfg(target_os = "linux")]
 const SG_IO: libc::c_ulong = 0x2285;
-const SG_DXFER_TO_DEV: libc::c_int = -2;
-const SG_DXFER_FROM_DEV: libc::c_int = -3;
+const SG_DXFER_TO_DEV: i32 = -2;
+const SG_DXFER_FROM_DEV: i32 = -3;
 
 impl Sg {
     #[cfg(target_os = "linux")]
@@ -159,6 +163,33 @@ impl Sg {
         Ok(())
     }
 
+    /// Windows：打开卷句柄，直通命令必须用读写方式打开（无需管理员）。
+    #[cfg(target_os = "windows")]
+    pub fn open(path: &Path, _write: bool) -> Result<Self> {
+        let letter = crate::winapi::drive_letter(path)?;
+        let raw = crate::winapi::Raw::open(letter, true)
+            .with_context(|| format!("无法访问 {}", path.display()))?;
+        let drive = Self { raw };
+        let mut inquiry = [0u8; 36];
+        drive.cmd(
+            &mut [0x12, 0, 0, 0, 36, 0],
+            SG_DXFER_FROM_DEV,
+            &mut inquiry,
+            5000,
+        )?;
+        ensure!(
+            matches!(inquiry[0] & 0x1f, 0 | 5),
+            "目标设备不是 IS903（SCSI 类型 {}）",
+            inquiry[0] & 0x1f
+        );
+        Ok(drive)
+    }
+
+    #[cfg(target_os = "windows")]
+    fn cmd(&self, cdb: &mut [u8], dir: i32, buf: &mut [u8], timeout_ms: u32) -> Result<()> {
+        self.raw.cmd(cdb, dir == SG_DXFER_FROM_DEV, buf, timeout_ms)
+    }
+
     /// 读容量(块大小 / 最后一块)
     pub fn capacity(&self) -> Result<(u32, u32)> {
         let mut cdb = [0x25u8, 0, 0, 0, 0, 0, 0, 0, 0, 0];
@@ -169,9 +200,15 @@ impl Sg {
         Ok((last, bs))
     }
 
-    /// 标准 READ(10),读的是「光盘」可见内容
-    pub fn read10(&self, lba: u32, out: &mut [u8]) -> Result<()> {
-        let n = (out.len() / BLK) as u16;
+    /// 标准 READ(10)。`block` 是设备逻辑块大小（光盘 2048，大容量存储 512）。
+    pub fn read10(&self, lba: u32, out: &mut [u8], block: u32) -> Result<()> {
+        ensure!(block > 0, "设备逻辑块大小为 0");
+        ensure!(
+            out.len() % block as usize == 0,
+            "读取长度 {} 不是块大小 {block} 的整数倍",
+            out.len()
+        );
+        let n = u16::try_from(out.len() as u32 / block).context("单次读取块数过多")?;
         let mut cdb = [0x28u8, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         cdb[2..6].copy_from_slice(&lba.to_be_bytes());
         cdb[7..9].copy_from_slice(&n.to_be_bytes());
@@ -230,7 +267,11 @@ impl Sg {
         self.pm(group, 0xff, param, 0, 12, SG_DXFER_TO_DEV, &mut response)
     }
 
-    pub fn write_iso(&self, image: &Path, mut progress: impl FnMut(u64, u64)) -> Result<()> {
+    pub fn write_iso(
+        &self,
+        image: &Path,
+        mut progress: impl FnMut(u64, u64) -> bool,
+    ) -> Result<()> {
         let mut image = File::open(image)?;
         let total = image.metadata()?.len();
         let (last, block_size) = self.capacity().context("读取光驱容量")?;
@@ -276,23 +317,74 @@ impl Sg {
             )
             .context("写入光驱镜像")?;
             done += n as u64;
-            progress(done, total);
+            if !progress(done, total) {
+                bail!("已取消烧录");
+            }
         }
         self.exchange(group, 0x81).context("写入后握手")
     }
 
-    pub fn verify_iso(&self, image: &Path, mut progress: impl FnMut(u64, u64)) -> Result<()> {
+    /// 按字节偏移读取，自动按设备逻辑块大小换算 LBA。
+    ///
+    /// macOS 需要先接管 USB 接口才能直通，暂不提供导出功能， macOS 上不编译。
+    #[cfg(not(target_os = "macos"))]
+    fn read_at(&self, offset: u64, out: &mut [u8], block: u32) -> Result<()> {
+        ensure!(
+            out.len() % block as usize == 0,
+            "读取长度 {} 不是块大小 {block} 的整数倍",
+            out.len()
+        );
+        let lba = u32::try_from(offset / u64::from(block))?;
+        self.read10(lba, out, block)
+    }
+
+    /// 整盘导出（只读）：从 PVD 读卷空间大小，再逐块倒出
+    #[cfg(not(target_os = "macos"))]
+    pub fn dump_iso(&self, out: &Path, mut progress: impl FnMut(u64, u64) -> bool) -> Result<u64> {
+        let (_, block) = self.capacity().context("读取设备块大小")?;
+        ensure!(block > 0, "设备逻辑块大小为 0");
+        let mut pvd = vec![0u8; BLK];
+        self.read_at(u64::try_from(16 * BLK)?, &mut pvd, block)
+            .context("读取主卷描述符")?;
+        ensure!(&pvd[1..6] == b"CD001", "LBA 16 不是 ISO 9660 卷描述符");
+        let sectors = u32::from_le_bytes([pvd[80], pvd[81], pvd[82], pvd[83]]);
+        ensure!(sectors > 0, "卷空间大小为 0");
+        let total = u64::from(sectors) * BLK as u64;
+        let mut file = File::create(out).with_context(|| format!("创建 {} 失败", out.display()))?;
+        let mut buf = vec![0u8; CHUNK];
+        let mut done = 0u64;
+        while done < total {
+            let n = (total - done).min(CHUNK as u64) as usize;
+            self.read_at(done, &mut buf[..n], block)
+                .with_context(|| format!("读取偏移 {done} 失败"))?;
+            file.write_all(&buf[..n])?;
+            done += n as u64;
+            if !progress(done, total) {
+                bail!("已取消导出");
+            }
+        }
+        file.sync_all().context("写入输出文件失败")?;
+        Ok(done)
+    }
+
+    pub fn verify_iso(
+        &self,
+        image: &Path,
+        mut progress: impl FnMut(u64, u64) -> bool,
+    ) -> Result<()> {
         let mut image = File::open(image)?;
         let total = image.metadata()?.len();
-        ensure!(total > 0 && total % BLK as u64 == 0, "ISO 长度无效");
+        let (_, block) = self.capacity().context("读取设备块大小")?;
+        ensure!(block > 0, "设备逻辑块大小为 0");
+        ensure!(total > 0 && total % u64::from(block) == 0, "ISO 长度无效");
         let mut expected = vec![0; CHUNK];
         let mut actual = vec![0; CHUNK];
         let mut done = 0;
         while done < total {
             let n = (total - done).min(CHUNK as u64) as usize;
-            let lba = u32::try_from(done / BLK as u64)?;
+            let lba = u32::try_from(done / u64::from(block))?;
             image.read_exact(&mut expected[..n])?;
-            self.read10(lba, &mut actual[..n])
+            self.read10(lba, &mut actual[..n], block)
                 .with_context(|| format!("READ(10) 回读 LBA {lba}"))?;
             if let Some(offset) = actual[..n]
                 .iter()
@@ -302,7 +394,9 @@ impl Sg {
                 bail!("整盘回读不一致，首个差异位于字节 {}", done + offset as u64);
             }
             done += n as u64;
-            progress(done, total);
+            if !progress(done, total) {
+                bail!("已取消烧录");
+            }
         }
         Ok(())
     }

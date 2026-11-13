@@ -6,7 +6,9 @@
 //!         CD-ROM 模式通过 libusb 接管 USB BOT 接口。
 
 use anyhow::{ensure, Context, Result};
-use std::path::{Path, PathBuf};
+#[cfg(not(target_os = "windows"))]
+use std::path::Path;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,7 +62,10 @@ impl Device {
     }
 
     pub fn check_access(&self) -> Result<()> {
-        ensure!(self.capacity > 0, "设备容量为 0,请重新插入设备");
+        ensure!(
+            self.capacity > 0,
+            "设备未就绪（容量为 0）：请放入光盘或重新插拔设备，然后点「刷新」"
+        );
         #[cfg(target_os = "macos")]
         if !self.is_writable() {
             self.usb_session()?;
@@ -70,19 +75,37 @@ impl Device {
             );
             return Ok(());
         }
-        let path = if self.is_writable() {
-            &self.node
-        } else {
-            self.sg_node
-                .as_ref()
-                .context("缺少 SCSI 通用节点,请在 Linux 上加载 sg 模块")?
-        };
-        std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path)
-            .with_context(|| format!("无法访问 {},请检查设备权限", path.display()))?;
-        Ok(())
+        #[cfg(target_os = "windows")]
+        {
+            // 直通命令必须用读写方式打开卷句柄（非管理员可用）。
+            let letter = crate::winapi::drive_letter(&self.node)?;
+            let drive = crate::winapi::Raw::open(letter, true)
+                .with_context(|| format!("无法访问 {},请确认设备已插入", self.node.display()))?;
+            let mut inquiry = [0u8; 36];
+            drive.cmd(&[0x12, 0, 0, 0, 36, 0], true, &mut inquiry, 5000)?;
+            ensure!(
+                matches!(inquiry[0] & 0x1f, 0 | 5),
+                "目标设备不是 IS903（SCSI 类型 {}）",
+                inquiry[0] & 0x1f
+            );
+            Ok(())
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let path = if self.is_writable() {
+                &self.node
+            } else {
+                self.sg_node
+                    .as_ref()
+                    .context("缺少 SCSI 通用节点,请在 Linux 上加载 sg 模块")?
+            };
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+                .with_context(|| format!("无法访问 {},请检查设备权限", path.display()))?;
+            Ok(())
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -474,12 +497,124 @@ mod macos {
     }
 }
 
+// ----------------------------------------------------------------- Windows ---
+
+#[cfg(target_os = "windows")]
+mod windows {
+    use super::*;
+    use crate::winapi;
+
+    fn inquiry_type(drive: &winapi::Raw) -> Option<u8> {
+        let mut buf = [0u8; 36];
+        drive
+            .cmd(&[0x12, 0, 0, 0, 36, 0], true, &mut buf, 5000)
+            .ok()?;
+        Some(buf[0] & 0x1f)
+    }
+
+    fn capacity_bytes(drive: &winapi::Raw) -> Option<u64> {
+        let mut buf = [0u8; 8];
+        drive
+            .cmd(&[0x25, 0, 0, 0, 0, 0, 0, 0, 0, 0], true, &mut buf, 10000)
+            .ok()?;
+        let last = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        let block = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+        Some((u64::from(last) + 1) * u64::from(block))
+    }
+
+    /// 枚举逻辑驱动器，用 STORAGE_DEVICE_DESCRIPTOR 识别 IS903。
+    ///
+    /// `\\.\C:` 这类系统盘非管理员打不开写句柄，会被自动跳过；
+    /// 若只拿得到只读句柄则容量记为 0，由 `check_access` 给出提示。
+    pub fn scan() -> Vec<Device> {
+        let mut devices = Vec::new();
+        for letter in winapi::logical_drives() {
+            let rw = winapi::Raw::open(letter, true).ok();
+            let ro = if rw.is_none() {
+                winapi::Raw::open(letter, false).ok()
+            } else {
+                None
+            };
+            let Some(drive) = rw.as_ref().or(ro.as_ref()) else {
+                continue;
+            };
+            let Ok(props) = winapi::properties(drive) else {
+                continue;
+            };
+            if !props.is_is903() {
+                continue;
+            }
+            let cdrom = winapi::is_cdrom(letter);
+            let (scsi_type, capacity) = match rw.as_ref() {
+                Some(drive) => (
+                    inquiry_type(drive).unwrap_or(if cdrom { 5 } else { 0 }),
+                    capacity_bytes(drive).unwrap_or(0),
+                ),
+                None => (if cdrom { 5 } else { 0 }, 0),
+            };
+            let serial = if props.serial.trim().is_empty() {
+                format!("{letter}")
+            } else {
+                props.serial.trim().to_owned()
+            };
+            devices.push(Device {
+                node: PathBuf::from(format!("{letter}:")),
+                vendor: props.vendor,
+                model: props.product,
+                scsi_type,
+                capacity,
+                sg_node: None,
+                usb: PathBuf::from(format!("{letter}:")),
+                interface: PathBuf::from(&serial),
+                serial,
+                devnum: String::new(),
+                lun: "0".to_owned(),
+            });
+        }
+        devices.sort_by(|a, b| (a.scsi_type, &a.node).cmp(&(b.scsi_type, &b.node)));
+        devices
+    }
+
+    /// 独占锁文件：用 `share_mode(0)` 打开，第二个实例会得到共享冲突。
+    pub fn lock_file(dev: &Device) -> Result<std::fs::File> {
+        use std::os::windows::fs::OpenOptionsExt;
+        let path = winapi::lock_path(&dev.serial, &dev.node.to_string_lossy());
+        std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .share_mode(0)
+            .open(&path)
+            .map_err(|e| anyhow::anyhow!("设备正在执行另一项烧录任务（{}：{e}）", path.display()))
+    }
+
+    /// Windows 上「重新枚举」就是丢弃光盘卷缓存：
+    /// `FSCTL_LOCK_VOLUME` + `FSCTL_DISMOUNT_VOLUME`，无需提权，也无需重启设备。
+    pub fn reenumerate(device: &Device, timeout: Duration) -> Result<Device> {
+        winapi::refresh_volume(&device.node).context("刷新光驱缓存失败")?;
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(found) = scan()
+                .into_iter()
+                .find(|d| d.same_connection(device) && d.capacity > 0)
+            {
+                return Ok(found);
+            }
+            ensure!(Instant::now() < deadline, "刷新后找不到目标 IS903");
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    }
+}
+
 // ---------------------------------------------------------- 平台分发 ---
 
 #[cfg(target_os = "linux")]
 use linux as imp;
 #[cfg(target_os = "macos")]
 use macos as imp;
+#[cfg(target_os = "windows")]
+use windows as imp;
 
 pub fn scan() -> Vec<Device> {
     imp::scan()

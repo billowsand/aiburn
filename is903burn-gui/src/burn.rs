@@ -1,25 +1,30 @@
-//! 烧录与校验:把 ISO 写入块设备,再用 O_DIRECT 回读比对。
+//! 烧录与校验:把 ISO 写入块设备,再回读比对。
 //!
-//! 为什么要 O_DIRECT:普通读取会命中内核页缓存,读到的可能只是缓存里的
-//! 数据,并不能证明「数据真的写进了闪存」。O_DIRECT 绕过全部缓存,读到
-//! 的一定是设备上的实际内容。
+//! 为什么要绕过缓存:普通读取会命中系统缓存,读到的可能只是缓存里的
+//! 数据,并不能证明「数据真的写进了闪存」。Linux 用 `O_DIRECT`、macOS 用
+//! `F_NOCACHE`、Windows 用 SCSI 直通 `READ(10)`(完全不经过文件系统),
+//! 读到的都是设备上的实际内容。
 
 use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
+#[cfg(not(target_os = "windows"))]
 use std::ffi::CString;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
+#[cfg(not(target_os = "windows"))]
 use std::os::unix::fs::OpenOptionsExt;
 #[cfg(target_os = "linux")]
 use std::os::unix::io::AsRawFd;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(not(target_os = "windows"))]
+use std::path::PathBuf;
 
 pub const CHUNK: usize = 4 * 1024 * 1024;
 
-/// 丢弃内核为该块设备缓存的页,避免挂载后看到旧内容
+/// 丢弃系统为该块设备缓存的页,避免挂载后看到旧内容
 ///
-/// Linux 用 `posix_fadvise(POSIX_FADV_DONTNEED)`;macOS 没有 fadvise,
-/// 但回读时用 `F_NOCACHE` 打开即可绕过缓存,这里退化为空操作。
+/// Linux 用 `posix_fadvise(POSIX_FADV_DONTNEED)`;macOS 用 `F_NOCACHE`,
+/// Windows 回读走 SCSI 直通;这两种情况这里退化为空操作。
 #[cfg(target_os = "linux")]
 pub fn drop_cache(path: &Path) -> Result<()> {
     let f = File::open(path).with_context(|| format!("打开 {} 失败", path.display()))?;
@@ -33,7 +38,7 @@ pub fn drop_cache(path: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(not(target_os = "linux"), not(target_os = "windows")))]
 pub fn drop_cache(_path: &Path) -> Result<()> {
     Ok(())
 }
@@ -52,13 +57,16 @@ fn raw_node(blk: &Path) -> PathBuf {
     blk.to_path_buf()
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn raw_node(blk: &Path) -> PathBuf {
     blk.to_path_buf()
 }
 
 /// 把 ISO 顺序写入块设备
-pub fn write_iso(blk: &Path, iso: &Path, mut progress: impl FnMut(u64, u64)) -> Result<()> {
+///
+/// `progress` 返回 `false` 表示取消，此时镜像可能只写了一半。
+#[cfg(not(target_os = "windows"))]
+pub fn write_iso(blk: &Path, iso: &Path, mut progress: impl FnMut(u64, u64) -> bool) -> Result<()> {
     let mut src = File::open(iso).with_context(|| format!("打开 {} 失败", iso.display()))?;
     let total = src.metadata()?.len();
 
@@ -84,11 +92,59 @@ pub fn write_iso(blk: &Path, iso: &Path, mut progress: impl FnMut(u64, u64)) -> 
         dst.write_all(&buf[..n + pad])
             .with_context(|| format!("写入 {} 失败", blk.display()))?;
         done += n as u64;
-        progress(done.min(total), total);
+        if !progress(done.min(total), total) {
+            bail!("已取消烧录");
+        }
     }
 
     // 确保数据落到设备
     dst.sync_all().context("fsync 失败")?;
+    drop(dst);
+    Ok(())
+}
+
+/// Windows 大容量存储模式:ISO 原样写到物理磁盘偏移 0。
+///
+/// 与 Linux 的块设备写入等价,但 `\\.\PHYSICALDRIVEn` 的写句柄需要管理员
+/// 权限,且该盘上的卷必须已经卸载;CD-ROM 模式不走这里。
+#[cfg(target_os = "windows")]
+pub fn write_iso(blk: &Path, iso: &Path, mut progress: impl FnMut(u64, u64) -> bool) -> Result<()> {
+    let mut src = File::open(iso).with_context(|| format!("打开 {} 失败", iso.display()))?;
+    let total = src.metadata()?.len();
+    let target =
+        crate::winapi::physical_drive_path(blk).context("无法定位 IS903 对应的物理磁盘")?;
+    let mut dst = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&target)
+        .with_context(|| {
+            format!(
+                "打开 {target} 失败（大容量存储模式的原始写入需要管理员权限，\
+                 且需先卸载该盘的所有卷）"
+            )
+        })?;
+
+    let mut buf = vec![0u8; CHUNK];
+    let mut done: u64 = 0;
+    loop {
+        let n = src.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        // 末块补齐到 512 字节
+        let pad = (512 - n % 512) % 512;
+        if pad > 0 {
+            buf[n..n + pad].fill(0);
+        }
+        dst.write_all(&buf[..n + pad])
+            .with_context(|| format!("写入 {target} 失败"))?;
+        done += n as u64;
+        if !progress(done.min(total), total) {
+            bail!("已取消烧录");
+        }
+    }
+
+    dst.sync_all().context("FlushFileBuffers 失败")?;
     drop(dst);
     Ok(())
 }
@@ -100,7 +156,7 @@ fn exclusive_flag() -> libc::c_int {
     libc::O_EXCL
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 #[inline]
 fn exclusive_flag() -> libc::c_int {
     0
@@ -113,14 +169,19 @@ fn direct_flag() -> libc::c_int {
     libc::O_DIRECT
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 #[inline]
 fn direct_flag() -> libc::c_int {
     0
 }
 
 /// 用 O_DIRECT 读回设备前 `len` 字节并计算 SHA-256
-fn sha256_odirect(blk: &Path, len: u64, mut progress: impl FnMut(u64, u64)) -> Result<Vec<u8>> {
+#[cfg(not(target_os = "windows"))]
+fn sha256_odirect(
+    blk: &Path,
+    len: u64,
+    mut progress: impl FnMut(u64, u64) -> bool,
+) -> Result<Vec<u8>> {
     let blk = &raw_node(blk);
     let cpath = CString::new(blk.as_os_str().to_string_lossy().as_bytes())
         .map_err(|_| anyhow::anyhow!("非法路径"))?;
@@ -188,7 +249,10 @@ fn sha256_odirect(blk: &Path, len: u64, mut progress: impl FnMut(u64, u64)) -> R
         let slice = unsafe { std::slice::from_raw_parts(raw as *const u8, want) };
         hasher.update(slice);
         done += want as u64;
-        progress(done, len);
+        if !progress(done, len) {
+            result = Err(anyhow::anyhow!("已取消烧录"));
+            break;
+        }
     }
 
     unsafe {
@@ -214,13 +278,30 @@ fn sha256_file(p: &Path) -> Result<Vec<u8>> {
 }
 
 /// 校验:设备前 `len` 字节是否与 ISO 完全一致
-pub fn verify_iso(blk: &Path, iso: &Path, mut progress: impl FnMut(u64, u64)) -> Result<bool> {
+#[cfg(not(target_os = "windows"))]
+pub fn verify_iso(
+    blk: &Path,
+    iso: &Path,
+    mut progress: impl FnMut(u64, u64) -> bool,
+) -> Result<bool> {
     let len = std::fs::metadata(iso)?.len();
     let a = sha256_file(iso)?;
     // 读之前先丢弃缓存,确保 O_DIRECT 拿到的是真实设备内容
     let _ = drop_cache(blk);
     let b = sha256_odirect(blk, len, &mut progress)?;
     Ok(a == b)
+}
+
+/// Windows:用 SCSI 直通 `READ(10)` 逐字节回读。
+///
+/// 直通不经过文件系统缓存,因此光盘模式和大容量存储模式都能用;
+/// 块大小由设备自己报告(光盘 2048,大容量存储 512)。
+#[cfg(target_os = "windows")]
+pub fn verify_iso(blk: &Path, iso: &Path, progress: impl FnMut(u64, u64) -> bool) -> Result<bool> {
+    let drive = crate::sg::Sg::open(blk, false)
+        .with_context(|| format!("无法打开 {} 进行回读校验", blk.display()))?;
+    drive.verify_iso(iso, progress)?;
+    Ok(true)
 }
 
 /// 递归收集一组路径下所有文件的 (大小, SHA-256)。

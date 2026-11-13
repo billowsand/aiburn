@@ -8,7 +8,7 @@
 //! 文件数据在两个目录树之间共享——PVD 和 Joliet 只是两套命名和目录块,
 //! 数据区只写一份。
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use std::fs::{self, File};
 use std::io::{BufWriter, Read, Seek, Write};
 use std::path::{Path, PathBuf};
@@ -17,6 +17,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub const SECTOR: u32 = 2048;
 const SECTORS_SYSTEM: u32 = 16;
 
+/// Joliet 标识符上限。
+///
+/// Joliet 规范写的是 32 个 UCS-2 码元(64 字节)，但 32 个字符对中文长文件名
+/// 太短(「XX公司2024年产品规格说明书(正式版).pdf」就已经超过)。Windows CDFS、
+/// Linux isofs、macOS 实际都接受 64 个字符 = 128 字节，genisoimage 的默认值
+/// 也是 64 个字符，这里采用同一上限。
+pub const JOLIET_MAX_CHARS: usize = 64;
+
+/// ISO 9660 允许的目录层级(根目录算第 1 层)
+const MAX_DEPTH: u16 = 8;
+
 /// 生成结果概要
 #[derive(Debug, Clone)]
 pub struct IsoSummary {
@@ -24,6 +35,8 @@ pub struct IsoSummary {
     pub bytes: u64,
     pub files: usize,
     pub dirs: usize,
+    /// 生成过程中需要提示用户的问题(例如文件名被截断)
+    pub warnings: Vec<String>,
 }
 
 // ------------------------------------------------------------------ 时间
@@ -162,11 +175,12 @@ impl Tree {
         Ok(Tree { nodes })
     }
 
-    fn assign_names(&mut self) -> Result<()> {
+    fn assign_names(&mut self) -> Result<Vec<String>> {
         // 根
         self.nodes[0].iso_name = vec![0u8];
         self.nodes[0].jol_name = vec![0u8];
 
+        let mut warnings = Vec::new();
         for i in 0..self.nodes.len() {
             let children = self.nodes[i].children.clone();
             let mut used_iso: Vec<String> = Vec::new();
@@ -176,15 +190,18 @@ impl Tree {
                 let raw = self.nodes[c].name.clone();
 
                 let iso = make_iso_name(&raw, is_dir, &used_iso);
-                let jol = make_joliet_name(&raw, &used_jol, is_dir);
-                used_iso.push(
-                    String::from_utf8_lossy(&iso)
-                        .trim_end_matches(";1")
-                        .to_owned(),
-                );
+                let (jol, truncated) = make_joliet_name(&raw, &used_jol);
+                // PVD 里文件标识符带 ";1" 版本号，比较时也必须带上，
+                // 否则同名的两个文件会生成重复的目录记录。
+                used_iso.push(String::from_utf8_lossy(&iso).into_owned());
                 used_jol.push(jol.clone());
                 self.nodes[c].iso_name = iso;
                 self.nodes[c].jol_name = jol;
+                if truncated {
+                    warnings.push(format!(
+                        "文件名超过 {JOLIET_MAX_CHARS} 个字符，光盘上将被截断：{raw}"
+                    ));
+                }
             }
         }
 
@@ -195,11 +212,16 @@ impl Tree {
                 bail!("内部错误:父节点不是目录");
             }
         }
-        Ok(())
+        Ok(warnings)
     }
 }
 
 fn add_child(nodes: &mut Vec<Node>, parent: usize, path: &Path, depth: u16) -> Result<()> {
+    ensure!(
+        depth < MAX_DEPTH,
+        "目录层级超过 ISO 9660 的 {MAX_DEPTH} 层限制：{}",
+        path.display()
+    );
     let meta =
         fs::symlink_metadata(path).with_context(|| format!("无法读取 {}", path.display()))?;
     if meta.is_symlink() {
@@ -279,8 +301,17 @@ fn make_iso_name(raw: &str, is_dir: bool, used: &[String]) -> Vec<u8> {
         format!("{base}.{ext}")
     };
 
+    // 目录没有版本号，文件标识符必须带 ";1"；比较时统一用最终写入的标识符
+    let identifier = |name: &str| {
+        if is_dir {
+            name.to_owned()
+        } else {
+            format!("{name};1")
+        }
+    };
+
     let mut n = 1;
-    while used.iter().any(|u| u == &candidate) {
+    while used.iter().any(|u| *u == identifier(&candidate)) {
         let suffix = format!("~{}", n);
         let mut b = base.clone();
         b.truncate(8usize.saturating_sub(suffix.len()));
@@ -294,18 +325,33 @@ fn make_iso_name(raw: &str, is_dir: bool, used: &[String]) -> Vec<u8> {
         n += 1;
     }
 
-    if is_dir {
-        candidate.into_bytes()
-    } else {
-        format!("{candidate};1").into_bytes()
-    }
+    identifier(&candidate).into_bytes()
 }
 
-fn make_joliet_name(raw: &str, used: &[Vec<u8>], _is_dir: bool) -> Vec<u8> {
-    let name: Vec<u16> = raw
+fn make_joliet_name(raw: &str, used: &[Vec<u8>]) -> (Vec<u8>, bool) {
+    // Windows 会吞掉末尾的点和空格，先去掉再截断，避免「名字看着短了」。
+    let mut chars: Vec<char> = raw
         .chars()
-        .map(|c| u16::try_from(c as u32).unwrap_or(b'_' as u16))
-        .take(32)
+        .map(|c| {
+            if u16::try_from(c as u32).is_ok() {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    while matches!(chars.last(), Some(' ' | '.')) {
+        chars.pop();
+    }
+    if chars.is_empty() {
+        chars.push('_');
+    }
+
+    let truncated = chars.len() > JOLIET_MAX_CHARS;
+    let name: Vec<u16> = chars
+        .iter()
+        .take(JOLIET_MAX_CHARS)
+        .map(|c| *c as u16)
         .collect();
 
     let mut candidate: Vec<u8> = name.iter().flat_map(|u| u.to_be_bytes()).collect();
@@ -315,13 +361,13 @@ fn make_joliet_name(raw: &str, used: &[Vec<u8>], _is_dir: bool) -> Vec<u8> {
         candidate = name
             .iter()
             .copied()
-            .take(32usize.saturating_sub(suffix.len()))
+            .take(JOLIET_MAX_CHARS.saturating_sub(suffix.len()))
             .chain(suffix.encode_utf16())
             .flat_map(u16::to_be_bytes)
             .collect();
         n += 1;
     }
-    candidate
+    (candidate, truncated)
 }
 
 // ------------------------------------------------------------------ 目录记录
@@ -489,7 +535,8 @@ fn build_path_table(tree: &Tree, joliet: bool, big_endian: bool) -> Vec<u8> {
         } else {
             node.iso_dir_lba
         };
-        let parent = if i == 0 { 0 } else { index_of[node.parent] };
+        // 根目录的父目录编号固定为 1(= 它自己)
+        let parent = if i == 0 { 1 } else { index_of[node.parent] };
 
         let name_len = name.len().max(1);
         out.push(name_len as u8);
@@ -587,16 +634,17 @@ fn layout(tree: &mut Tree) -> Result<(u32, u32, u32, u32, u32)> {
 /// 生成 ISO。
 ///
 /// `src` 是目录(内容放到光盘根)或单个文件。
-/// `progress` 在拷贝数据阶段被调用 `(已写字节, 总字节)`。
+/// `progress` 在拷贝数据阶段被调用 `(已写字节, 总字节)`，返回 `false` 表示取消。
 pub fn build_iso(
     srcs: &[PathBuf],
     label: &str,
     out: &Path,
     max_bytes: u64,
-    progress: &mut dyn FnMut(u64, u64),
+    progress: &mut dyn FnMut(u64, u64) -> bool,
 ) -> Result<IsoSummary> {
+    ensure!(!srcs.is_empty(), "请添加要烧录的文件或文件夹");
     let mut tree = Tree::collect(srcs)?;
-    tree.assign_names()?;
+    let warnings = tree.assign_names()?;
 
     let (pvd_l, pvd_m, jol_l, jol_m, total_sectors) = layout(&mut tree)?;
     let bytes = u64::from(total_sectors) * u64::from(SECTOR);
@@ -700,10 +748,13 @@ pub fn build_iso(
             let count = remaining.min(buffer.len() as u64) as usize;
             rf.read_exact(&mut buffer[..count])
                 .with_context(|| format!("读取 {} 失败", node.src.display()))?;
-            f.write_all(&buffer[..count])?;
+            f.write_all(&buffer[..count])
+                .with_context(|| format!("写入镜像失败（{} 所在磁盘空间不足？）", out.display()))?;
             remaining -= count as u64;
             written += count as u64;
-            progress(written, total_bytes);
+            if !progress(written, total_bytes) {
+                bail!("已取消烧录");
+            }
         }
         if rf.read(&mut buffer[..1])? != 0 {
             bail!("{} 在生成过程中变大", node.src.display());
@@ -739,6 +790,7 @@ pub fn build_iso(
         bytes,
         files,
         dirs,
+        warnings,
     })
 }
 
@@ -886,5 +938,77 @@ fn write_pvd(
 
     if escape.is_empty() == false {
         buf[88..88 + escape.len()].copy_from_slice(escape);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn joliet(name: &str, used: &[Vec<u8>]) -> (String, bool) {
+        let (bytes, truncated) = make_joliet_name(name, used);
+        let units: Vec<u16> = bytes
+            .chunks_exact(2)
+            .map(|c| u16::from_be_bytes([c[0], c[1]]))
+            .collect();
+        (String::from_utf16(&units).unwrap(), truncated)
+    }
+
+    #[test]
+    fn joliet_keeps_long_chinese_names() {
+        // 29 个字符，以前会被截断到 32 字符以内之外的边界上
+        let name = "中兴微电子_产品规格说明书_2024年正式版_v2.pdf";
+        let (kept, truncated) = joliet(name, &[]);
+        assert!(!truncated);
+        assert_eq!(kept, name);
+    }
+
+    #[test]
+    fn joliet_limit_is_64_chars() {
+        let name = "文".repeat(JOLIET_MAX_CHARS);
+        let (kept, truncated) = joliet(&name, &[]);
+        assert!(!truncated);
+        assert_eq!(kept.chars().count(), JOLIET_MAX_CHARS);
+
+        let longer = "文".repeat(JOLIET_MAX_CHARS + 3);
+        let (kept, truncated) = joliet(&longer, &[]);
+        assert!(truncated);
+        assert_eq!(kept.chars().count(), JOLIET_MAX_CHARS);
+    }
+
+    #[test]
+    fn joliet_avoids_trailing_dot_or_space() {
+        let (kept, _) = joliet("README.", &[]);
+        assert_eq!(kept, "README");
+        let (kept, _) = joliet("  名字  ", &[]);
+        assert_eq!(kept, "  名字");
+    }
+
+    #[test]
+    fn joliet_dedupes_truncated_names() {
+        let long = "a".repeat(JOLIET_MAX_CHARS + 10);
+        let (first, _) = joliet(&long, &[]);
+        let first_bytes = make_joliet_name(&long, &[]).0;
+        let (second, _) = joliet(&long, &[first_bytes]);
+        assert_ne!(first, second);
+        assert!(second.ends_with("~1"));
+        assert!(second.chars().count() <= JOLIET_MAX_CHARS);
+    }
+
+    #[test]
+    fn pvd_identifiers_stay_unique() {
+        // 两个不同的中文文件名会落到同一个 8.3 名字上，必须自动加 ~1
+        let used = Vec::new();
+        let a = make_iso_name("中兴报告.pdf", false, &used);
+        let used = vec![String::from_utf8_lossy(&a).into_owned()];
+        let b = make_iso_name("产品说明.pdf", false, &used);
+        assert_ne!(a, b);
+        assert!(String::from_utf8_lossy(&b).ends_with(";1"));
+    }
+
+    #[test]
+    fn joliet_replaces_non_bmp() {
+        let (kept, _) = joliet("表情😀.txt", &[]);
+        assert_eq!(kept, "表情_.txt");
     }
 }

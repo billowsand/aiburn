@@ -5,16 +5,17 @@ Innostar IS903 "USB Flash CD-ROM" (UFCD) chip using vendor SCSI commands.
 `is903burn` is a native Linux reimplementation of that protocol, speaking
 `SG_IO` directly to `/dev/sg0`.
 
-## 桌面程序（Linux 和 macOS）
+## 桌面程序（Linux、macOS 和 Windows）
 
-`is903burn-gui` 在两个平台使用相同的 GUI、CLI 和 ISO 生成器，支持 ISO 9660 + Joliet 和中文文件名。以下命令从仓库根目录运行。构建需要 Rust 1.95 或更新版本。
+`is903burn-gui` 在三个平台使用相同的 GUI、CLI 和 ISO 生成器，支持 ISO 9660 + Joliet 和中文文件名。以下命令从仓库根目录运行。构建需要 Rust 1.95 或更新版本。
 
 | 平台 | 构建命令 | 构建依赖 |
 | --- | --- | --- |
 | Linux | `./is903burn-gui/build-linux.sh` | C 工具链和 pkg-config。例如 Debian/Ubuntu 的 `build-essential`、`pkg-config` |
 | macOS | `./is903burn-gui/build-macos.sh` | Xcode Command Line Tools、libusb 1.0.30 或更新版本（`brew install libusb`） |
+| Windows | `powershell -ExecutionPolicy Bypass -File .\is903burn-gui\build-windows.ps1` | Rust 1.95+ 与 MSVC 工具链（`rustup default stable-x86_64-pc-windows-msvc`），无额外依赖 |
 
-两个脚本在各自的系统上构建 Release 版，默认输出到 `is903burn-gui/target/release/is903burn-gui`。macOS 构建使用 Homebrew 的 libusb，也可通过 `IS903_LIBUSB_PREFIX` 指定安装路径。运行时需要保留对应的 libusb 动态库。
+这些脚本在各自的系统上构建 Release 版，默认输出到 `is903burn-gui/target/release/`。macOS 构建使用 Homebrew 的 libusb，也可通过 `IS903_LIBUSB_PREFIX` 指定安装路径。运行时需要保留对应的 libusb 动态库。
 
 ```sh
 ./is903burn-gui/target/release/is903burn-gui            # 启动 GUI
@@ -23,18 +24,52 @@ Innostar IS903 "USB Flash CD-ROM" (UFCD) chip using vendor SCSI commands.
 
 - **Linux**：光驱烧录使用 `SG_IO`。需要加载 `sg` 模块并具备目标 `/dev/sgN` 的读写权限。挂载与卸载依赖 `udisksctl`（`udisks2`），刷新光驱时系统可能通过 `pkexec` 请求授权。
 - **macOS**：光驱烧录使用 libusb 接管 USB 接口。通过终端以管理员权限执行 `--burn`。挂载与卸载使用系统自带的 `diskutil`。[macOS 用法与实测记录](macOS.md)
+- **Windows**：光驱烧录使用 `DeviceIoControl(IOCTL_SCSI_PASS_THROUGH_DIRECT)` 直通到卷句柄 `\\.\X:`，**不需要管理员权限**。烧录后用 `FSCTL_LOCK_VOLUME` + `FSCTL_DISMOUNT_VOLUME` 刷新光驱视图，不需要 restart 设备。挂载由系统自动完成。只有「大容量存储模式」的原始块写入需要管理员权限。[Windows 实现与实测记录](windows.md)
 
-下面的 CLI 用法适用于两平台。macOS 光驱烧录时在烧录命令前加 `sudo`。目标设备节点以 `--devices` 的输出为准。
+### 图形界面
+
+界面按「小工具」设计：顶部是设备状态，中间是烧录内容，底部是卷标和主按钮。
+
+![图形界面](is903burn-gui/screenshots/main.png)
+
+- 把文件或文件夹直接拖进窗口即可加入列表；文件夹里的内容会放到光盘根目录。
+- 点击空列表也可以选择文件；每个来源显示大小（文件夹显示文件数），`✕` 移除。
+- 快捷键：`Enter` 打开确认框，`F5` 重新扫描设备。烧录中可按「取消」中止，但写入已开始时
+  光盘内容可能不完整。
+- 卷标默认取第一个来源的名字（最多 16 个字符），手动改过后不再自动更新。
+- 设备未就绪（例如光驱里没有光盘）时按钮为灰色，并在设备卡片里说明原因。
+- 也可以把文件/文件夹拖到 `is903burn-gui.exe` 图标上，界面会带着这些来源启动。
+
+更多状态截图：[烧录中](is903burn-gui/screenshots/burning.png)、[确认对话框](is903burn-gui/screenshots/confirm.png)。
+
+**文件名长度**：ISO 里同时写 ISO 9660 主树（8.3 短名，仅作老设备的兼容回退）和 Joliet 树
+（原名、中文）。Joliet 单个名字最长 **64 个字符**，这是 Windows、Linux、macOS 通行的上限，
+也是 `genisoimage` 的默认值；超过的文件名会被截断，界面在烧录完成时提示并在「运行详情」
+里列出具体文件名。目录层级最多 8 层（ISO 9660 限制），超过会直接报错而不是写出坏镜像。
+
+下面的 CLI 用法适用于三个平台。macOS 光驱烧录时在烧录命令前加 `sudo`。目标设备以 `--devices` 的输出为准：Linux 是 `/dev/sr0` 一类设备节点，Windows 是驱动器号 `D:`。
 
 ```sh
 ./is903burn-gui/target/release/is903burn-gui --mkiso ./data -l MYDATA -o /tmp/data.iso
-./is903burn-gui/target/release/is903burn-gui --burn /dev/设备节点 -l MYDATA ./data
+./is903burn-gui/target/release/is903burn-gui --burn 设备 -l MYDATA ./data
 ```
+
+### 现成 ISO 的读写与校验
+
+```sh
+is903burn-gui --dump   <设备> current.iso   # 导出设备里现有的镜像
+is903burn-gui --verify <设备> current.iso   # 只读校验，不改动设备
+is903burn-gui --write  <设备> new.iso       # 把现成 ISO 写进设备（破坏性）
+```
+
+`--dump` 与 `--verify` 只读，可用于备份与事后核对；`--write` 与 `--burn`
+会覆盖光盘内容。
 
 **Documentation**
 
 * [使用流程.md](使用流程.md) — 完整操作手册(中文):环境准备、设备确认、
   提取镜像、制作 ISO、烧录、校验、故障排查、一键脚本。
+* [windows.md](windows.md) — Windows 后端实现与真机实测记录。
 * `is903-burn.sh` — 一键烧录脚本(推荐日常使用)。
 * [PROTOCOL.md](PROTOCOL.md) — the reverse engineered vendor SCSI protocol.
 * [README.md](README.md) — this file: build and command reference.

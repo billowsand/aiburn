@@ -3,6 +3,8 @@
 //! Linux: 走 udisks2(D-Bus),普通用户即可,不必提权。
 //! macOS: 走 `diskutil`,同样不需要提权(unmountDisk / mount)。
 
+#[cfg(target_os = "windows")]
+use anyhow::Context;
 use anyhow::{bail, Result};
 use std::path::{Path, PathBuf};
 
@@ -130,12 +132,44 @@ mod macos {
     }
 }
 
+// ------------------------------------------------------------- Windows ---
+
+#[cfg(target_os = "windows")]
+mod windows {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// 卸载：锁定并卸载卷，让 Windows 丢弃已被缓存的旧镜像。
+    /// 不需要管理员权限。
+    pub fn unmount(blk: &Path) -> Result<()> {
+        crate::winapi::refresh_volume(blk).with_context(|| format!("无法卸载 {}", blk.display()))
+    }
+
+    /// 挂载：Windows 会自动重新挂载 CDFS，这里等待盘符可用并返回根目录。
+    pub fn mount(blk: &Path) -> Result<PathBuf> {
+        let root = crate::winapi::volume_root(blk)?;
+        let path = PathBuf::from(&root);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            if std::fs::read_dir(&path).is_ok() {
+                return Ok(path);
+            }
+            if Instant::now() >= deadline {
+                bail!("无法访问 {}，请确认设备已插入且未被占用", root);
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+}
+
 // ---------------------------------------------------------- 平台分发 ---
 
 #[cfg(target_os = "linux")]
 use linux as imp;
 #[cfg(target_os = "macos")]
 use macos as imp;
+#[cfg(target_os = "windows")]
+use windows as imp;
 
 pub fn unmount(blk: &Path) -> Result<()> {
     imp::unmount(blk)
