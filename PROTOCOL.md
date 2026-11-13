@@ -9,10 +9,10 @@ These notes are the reference for `is903burn.c`.
 
 * 32-bit Delphi GUI, window class `TFm_Main`, caption `AI-Burn`.
 * Version string: `EAI-Burn 1.0.0.8 (C)Innostor Technology Corporation`.
-* Windows-only: it reaches the device through the SCSI pass-through IOCTLs
-  and SetupAPI (`SetupDiGetClassDevsW` / `CM_Get_Device_IDW`), so it cannot
-  run natively on Linux as-is. The functional core is small, however, and
-  is reimplemented in `is903burn.c`.
+* The Windows tool uses SCSI pass-through IOCTLs and SetupAPI
+  (`SetupDiGetClassDevsW` / `CM_Get_Device_IDW`). The Linux tool uses
+  block I/O for its supported burn path and SG_IO for experimental vendor
+  commands.
 
 ## 2. Device
 
@@ -66,26 +66,26 @@ Sub opcodes of the `P.M.` group that AIBurn.exe uses:
 
 | opcode | direction | meaning |
 |---|---|---|
-| `0x00` | from device | read blocks of the stored image |
-| `0x03` | to device | write blocks of the stored image |
-| `0x07` | to device | set title / label (16 bytes) |
+| `0x00` | Windows SPTD `DataIn=0` | used by the **Burn Image** loop at `0x410dd9` |
+| `0x03` | Windows SPTD `DataIn=1` | used by the **Save ISO Image** loop and the preparation call below |
+| `0x07` | from device | 16-byte response (called at `0x404dd3` / `0x404e25`) |
 | `0x08` | from device | 2 byte challenge for the key exchange |
 | `0xff` | to device | 12 byte key response |
 
 ### `P.M.` read / write details
 
-From the helper routines at `0x40202c` (write) and `0x402144` (read):
+From the helper routines at `0x40202c` (op `0x03`) and `0x402144` (op `0x00`):
 
-* byte 3 is always `0x01`
-* the offset field counts 512 byte blocks and is advanced by `0x80` blocks
-  (64 KiB) after every transfer
+* byte 3 is supplied by the caller. The Burn Image data loop uses `0x01`.
+  The preparation call uses `0x05` with op `0x03`.
+* the offset and count use 512-byte units. The ISO loop advances the LBA by
+  `0x80` after each 64 KiB transfer and rounds a partial transfer up to 512 bytes.
 * the count field is the number of 512 byte blocks, `0x80` per transfer
 * the transfer length is `count * 512`
 
-AIBurn.exe burns an image by looping over 64 KiB chunks and issuing one
-`P.M.` write per chunk, advancing the LBA by `0x80` each time. The Linux
-implementation does exactly the same, and the chunking was verified against
-the mock device.
+The Linux experimental `read` and `write` commands currently use the opposite
+directions for those opcodes. Mock tests check the current Linux mapping.
+See section 11 for the recovered Windows sequence and verification status.
 
 ### `INQU`
 
@@ -99,7 +99,7 @@ rather than assuming an alignment.
 
 ## 4. The 12 byte key exchange
 
-Before writing, AIBurn.exe performs a challenge/response:
+AIBurn.exe uses this challenge/response routine before and after ISO transfer:
 
 1. `P.M.` op `0x08` reads 2 bytes from the device.
 2. Those 2 bytes are combined big endian into a 16 bit value.
@@ -132,8 +132,7 @@ original x86 code for all 65536 possible challenges.
 * `IOCTL_SCSI_PASS_THROUGH` (`0x4d004`) for the inquiry calls
 * `IOCTL_SCSI_PASS_THROUGH_DIRECT` (`0x4d014`) for everything with data
 
-The application does not use the stock Windows
-`SCSI_PASS_THROUGH_DIRECT` layout. It lays the structure out as:
+The 32-bit Windows `SCSI_PASS_THROUGH_DIRECT` layout used here is:
 
 ```
 +0x00 USHORT Length = 0x2c
@@ -143,22 +142,17 @@ The application does not use the stock Windows
 +0x05 UCHAR  LunId = 0
 +0x06 UCHAR  CdbLength
 +0x07 UCHAR  SenseInfoLength = 0
-+0x08 UCHAR  Direction       0 = read, 1 = write
++0x08 UCHAR  DataIn          0 = host to device, 1 = device to host
 +0x0c ULONG  DataTransferLength
-+0x10 ULONG  (10)
++0x10 ULONG  TimeOutValue    seconds (10 for the op 0x03 bulk helper)
 +0x14 ULONG  DataBuffer
 +0x18 ULONG  (0)
 +0x1c UCHAR  Cdb[16]
 ```
 
-Two details worth noting:
-
-* The direction is an explicit field in the struct, because the vendor
-  opcode `0xFC` does not imply one. On Linux this maps to the
-  `dxfer_direction` of `SG_IO`.
-* The data buffer pointer is a plain 32-bit value, so the app can only
-  address the low 2 GiB of its address space. It writes the CDB into the
-  structure at `+0x1c` and then overwrites byte 0 with `0xFC`.
+The direction maps to `dxfer_direction` in Linux `SG_IO`. The buffer pointer
+is 32 bits in this PE32 binary. The helpers copy the CDB to `+0x1c`.
+[Microsoft SCSI_PASS_THROUGH_DIRECT reference](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntddscsi/ns-ntddscsi-_scsi_pass_through_direct)
 
 On Linux the equivalent transport is plain `SG_IO` on `/dev/sg0`, which is
 what `is903burn.c` uses. The Windows `\\.\H:` / `\\.\G:` volume handles
@@ -168,7 +162,8 @@ have no Linux counterpart.
 
 * The CDB is identical on both platforms; only the transport differs.
 * Linux needs the `sg` module for `/dev/sg0` to appear
-  (`sudo modprobe sg`). `/dev/sr0` itself rejects `SG_IO`.
+  (`sudo modprobe sg`). On the test host, read-only `/dev/sr0` accepted
+  `READ CAPACITY(10)` via `SG_IO` and rejected vendor `INQU` with `EPERM`.
 * The device firmware can wedge if it receives malformed vendor commands.
   A wedged device stops enumerating over USB and only recovers with a
   physical unplug/replug.
@@ -221,9 +216,9 @@ This was verified on hardware: writing a patched ISO (volume label
 contained `AIBurn.exe` still matched its SHA-256. The original image was
 then restored.
 
-In CD-ROM mode (SCSI type 5) the block device is read only and the vendor
-`P.M.` opcodes are refused, so `burn` and `dump` report that the
-mass-storage mode is required.
+In CD-ROM mode (SCSI type 5) the block device is read only. The Linux
+`burn` and `dump` commands currently reject type 5. The vendor path tested
+earlier used the Linux opcode/direction mapping described in section 3.
 
 The SCSI vendor string reported by the device is `Innostor`.
 
@@ -270,13 +265,8 @@ The SCSI vendor string reported by the device is `Innostor`.
 
 ### 结论
 
-写入命令会被接受,但数据既不进入 `READ(10)` 的光盘视图,也无法在重新
-枚举后保留。AI Burn 在 Windows 上可以正常烧录(且不需要拔插),说明
-还缺一个"提交/重新挂载介质"的步骤,很可能由 Innostor 的过滤驱动或某个
-尚未识别的厂商命令完成。
-
-要定位这一步,需要用 USBPcap 抓一次 Windows 上 AI Burn 烧录小 ISO 的
-USB 流量(过滤 `usb.idVendor == 0x1f75`),对比后即可补齐。
+历史测试中的 `WRITE(12)` 数据没有进入 `READ(10)` 的光盘视图，重新枚举
+后也未保留。第 11 节记录了 Windows 程序实际走的厂商命令及设备重启路径。
 
 ## 10. 模式切换与恢复的实测记录
 
@@ -308,3 +298,69 @@ USB 流量(过滤 `usb.idVendor == 0x1f75`),对比后即可补齐。
 
 **结论**:模式不是由主机命令主动切换的,而是固件根据内部状态(ISO 是否
 有效、是否处于异常)自行决定。主机侧能做的是温和地重新枚举设备。
+
+## 11. 单 ISO 烧录路径复核
+
+对照设备原盘上的 AIBurn.exe 和仓库副本，SHA-256 均为
+`81755ab6a34a93bbf07dbb460348eb4f05fbb3dbfdb2801067b5f093f9f0061f`。
+下表的地址是 PE 虚拟地址，可以用 `objdump -d -Mintel AIBurn.exe` 复核。
+
+| 调用点 | 反汇编中确认的操作 |
+|---|---|
+| `0x40ee84`、`0x40f2eb` | Delphi 事件表将 `BTNBurnISOClick` 绑定到前者。后者打开 `\\.\X:` 光驱卷句柄。 |
+| `0x410aad` | 调用 `0x402804`。满足设备记录中的版本条件时，通过 `0x08` 取 2 字节挑战值，再以 CDB byte 3 = `0x80` 发送 12 字节 `0xff` 响应。 |
+| `0x410afa` → `0x402e1c` → `0x40202c` | 分区记录辅助函数。先用 `P.M. 0x03`、byte 3 = `0x05`、LBA 0、count 8 请求 4096 字节，随后在缓冲区内查找匹配或空闲的 512 字节记录。 |
+| `0x410ea7` → `0x410dd9` → `0x402144` | 从源文件读取最多 64 KiB，发送 `P.M. 0x00`、byte 3 = `0x01`。LBA 来自所选分区记录，单分区分支将它设为 0（`0x40ae14`）。 |
+| `0x412667` | 再调用 `0x402804`，这次 `0xff` 响应的 CDB byte 3 = `0x81`。随后关闭 ISO 和设备句柄。 |
+| `0x412734` → `0x404e54` | 成功分支调用 SetupAPI，设置 `DIF_PROPERTYCHANGE` 和 `DICS_PROPCHANGE`，再调用 `SetupDiChangeState`。Windows 对匹配的设备执行停止和重新启动。 |
+
+以 LBA 0 的首个完整 64 KiB 为例，ISO 数据 CDB 为
+`fc GG 00 01 00 00 00 00 00 80 00 00 50 2e 4d 2e`，其中 `GG`
+是设备报告的 `P.M.` 组索引。上述数据阶段的 Windows `DataIn` 分别是
+`0x08 → 1`、`0xff → 0`、准备 `0x03 → 1`、传输 `0x00 → 0`。
+反向核对 `Save ISO Image`，`0x43913c` 调用 `0x40202c`，
+返回后数据进入写文件流程，进一步确认这两条数据命令的方向。
+[Microsoft SP_PROPCHANGE_PARAMS reference](https://learn.microsoft.com/en-us/windows/win32/api/setupapi/ns-setupapi-sp_propchange_params)
+
+Linux 真机测试已确认整套顺序可以更新光盘镜像，重新绑定 USB 存储接口以及
+物理拔插后均可通过 `READ(10)` 完整回读。测试保留了 `0x81` 应答，
+因此其独立作用尚未验证。
+
+### 2026-11-13 Linux 复测
+
+* 设备是 USB `1f75:0903`，SCSI 厂商字符串为 `FANG`，型号为
+  `CD-ROM on Flash`，类型为 5。脚本按 VID/PID 补充识别后能找到 `/dev/sr0`。
+* 宿主机上 `/dev/sr0` 只读，`O_RDWR` 返回 `EROFS`。缺少 `/dev/sgN`，
+  加载 `sg` 需要本机 sudo 认证。未执行厂商写入。
+* 用 `xorrisofs` 生成 15,736,832 字节的测试 ISO。用模拟块设备执行
+  `burn` → `dump` → `cmp`，结果逐字节一致。原盘通过普通块读取备份了
+  1376 个 2048 字节扇区。
+
+### 2026-11-13 CD-ROM 真机烧录
+
+* 通过系统认证加载 `sg` 后，`INQU` 确认序列号为
+  `000000000000000008`，`P.M.` 组索引为 6，SCSI 类型为 5。
+* 测试镜像只修改原盘的 ISO 9660 和 Joliet 卷标为 `IS903TEST`，
+  大小仍为 2,818,048 字节。先卸载光驱，再通过 `/dev/sg0` 发送
+  `0x80` 应答、4096 字节分区记录请求、5504 个 512 字节块的 ISO
+  数据和 `0x81` 应答。所有命令均成功且无残余传输。
+* 重新绑定目标 `usb-storage` 接口后，设备仍枚举为只读
+  `/dev/sr0`。标准 `READ(10)` 回读 1376 个 2048 字节扇区，
+  与测试 ISO 逐字节一致。重新挂载的卷标为 `IS903TEST`，
+  其中 `AIBurn.exe` 与原盘文件逐字节一致。
+* 物理拔插后，USB 设备地址从 11 变为 12，序列号一致，SCSI 类型仍为 5。
+  再次用 `READ(10)` 回读整盘并通过 `cmp`，确认镜像在断电后保留。
+* 测试 ISO 和回读的 SHA-256 均为
+  `2cb30d05737b89256b366aba66a5129472f67333d1a73af14b24b0adf46991b5`。
+  这一流程使用临时测试程序，现有 CLI 的 `burn` 仍走块写入路径。
+
+### 2026-11-13 更换文件复测
+
+* 将 `Aahj.ttf` 制作为卷标 `IS903FONT` 的 ISO，大小为 15,728,640 字节。
+  按同一顺序通过 `/dev/sg0` 烧录，完整写入 30,720 个 512 字节块，
+  准备和收尾应答均成功。
+* 通过标准 `READ(10)` 回读全部 7680 个 2048 字节扇区，与源 ISO 逐字节一致，
+  SHA-256 为 `565640b06cae9419b2e963b38271a1120659673b1a9a276dc044d3bbafddcc70`。
+  重新绑定目标 USB 存储接口后再次执行整盘 `READ(10)`，结果一致。
+  从回读 ISO 提取的字体及重新挂载后读取的字体均与源文件逐字节一致，SHA-256 为
+  `92d6a6396da1ca6277538487b80a18b5fad2196827b05e87b3754219a9a904e5`。

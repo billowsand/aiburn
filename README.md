@@ -7,7 +7,7 @@ Innostar IS903 "USB Flash CD-ROM" (UFCD) chip using vendor SCSI commands.
 
 **图形界面(推荐)**
 
-`is903burn-gui/` 是基于已验证块设备路径的 Rust + egui 桌面程序:
+`is903burn-gui/` 是支持 IS903 光驱和大容量存储模式的 Rust + egui 桌面程序。
 
 ```sh
 cd is903burn-gui
@@ -15,13 +15,14 @@ cargo build --release
 ./target/release/is903burn-gui
 ```
 
-功能:自动检测 IS903 设备(下拉框选择,只读模式会提示原因)、导入文件/文件夹、
-实时空间计算与超容拦截、后台烧录进度、O_DIRECT 回读校验、烧完自动挂载。
+选择设备，添加或拖入文件和文件夹，设置卷标后即可烧录。程序生成 ISO 并检查
+容量，卸载设备后在后台写入。光驱模式使用已在真机验证的 `P.M.` 命令，
+随后重新绑定同一 USB 存储接口，再用 `READ(10)` 回读整盘。大容量存储
+模式使用块写入与 `O_DIRECT` 回读。整盘验证、自动挂载和文件哈希核对
+都通过后，界面才显示烧录完成。
 
-烧录流程:卸载 → 生成 ISO → 写入+fsync → 丢弃缓存 → O_DIRECT 整盘比对 →
-挂载 → 逐文件哈希核对。若挂载后核对发现内容仍是旧的(设备固件可能缓存
-旧镜像),会自动对 usb-storage 接口做 unbind/bind 让设备重新枚举,再挂载
-核对一次 —— 全程不需要物理拔插。
+光驱模式需要加载 `sg`，并有目标 `/dev/sgN` 的读写权限。挂载和卸载
+使用 `udisksctl`，重新绑定 USB 存储接口时系统可能通过 `pkexec` 请求授权。
 
 ISO 由程序内部纯 Rust 生成(ISO 9660 + Joliet,支持中文文件名),不依赖
 `xorrisofs` 等外部工具。

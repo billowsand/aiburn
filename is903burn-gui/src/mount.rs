@@ -33,27 +33,16 @@ pub fn mount_points(blk: &Path) -> Vec<PathBuf> {
 
 /// 卸载设备上所有挂载点
 pub fn unmount(blk: &Path) -> Result<()> {
-    for mp in mount_points(blk) {
-        let mp_s = mp.to_string_lossy().to_string();
-        let b = blk.to_string_lossy().to_string();
-        if run("udisksctl", &["unmount", "-b", &b]).map(|r| r.0).unwrap_or(false) {
-            continue;
-        }
-        if run("umount", &[&mp_s]).map(|r| r.0).unwrap_or(false) {
-            continue;
-        }
-        // 懒卸载作为最后手段
-        let _ = run("umount", &["-l", &mp_s]);
-    }
     if !mount_points(blk).is_empty() {
-        bail!(
-            "卸载失败,仍挂载在: {}",
-            mount_points(blk)
-                .iter()
-                .map(|p| p.display().to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
+        let device = blk.to_string_lossy();
+        let (_, output) = run("udisksctl", &["unmount", "-b", &device])?;
+        if !mount_points(blk).is_empty() {
+            bail!(
+                "无法卸载 {}。请关闭正在使用光驱或磁盘的窗口，再重试。\n{}",
+                blk.display(),
+                output.trim()
+            );
+        }
     }
     Ok(())
 }
@@ -61,16 +50,7 @@ pub fn unmount(blk: &Path) -> Result<()> {
 /// 挂载设备,返回挂载点
 pub fn mount(blk: &Path) -> Result<PathBuf> {
     let b = blk.to_string_lossy().to_string();
-    let (ok, out) = run("udisksctl", &["mount", "-b", &b])?;
-    if ok {
-        if let Some(pos) = out.find(" at ") {
-            let p = out[pos + 4..].trim().to_string();
-            if !p.is_empty() {
-                return Ok(PathBuf::from(p));
-            }
-        }
-    }
-    // 回退:直接看内核挂载表(有时 udisks 报 "already mounted")
+    let (_, out) = run("udisksctl", &["mount", "-b", &b])?;
     if let Some(mp) = mount_points(blk).into_iter().next() {
         return Ok(mp);
     }

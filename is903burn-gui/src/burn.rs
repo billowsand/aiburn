@@ -9,6 +9,7 @@ use sha2::{Digest, Sha256};
 use std::ffi::CString;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
 
@@ -19,22 +20,22 @@ pub fn drop_cache(path: &Path) -> Result<()> {
     let f = File::open(path).with_context(|| format!("打开 {} 失败", path.display()))?;
     let rc = unsafe { libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
     if rc != 0 {
-        bail!("posix_fadvise 失败: {}", std::io::Error::from_raw_os_error(rc));
+        bail!(
+            "posix_fadvise 失败: {}",
+            std::io::Error::from_raw_os_error(rc)
+        );
     }
     Ok(())
 }
 
 /// 把 ISO 顺序写入块设备
-pub fn write_iso(
-    blk: &Path,
-    iso: &Path,
-    mut progress: impl FnMut(u64, u64),
-) -> Result<()> {
+pub fn write_iso(blk: &Path, iso: &Path, mut progress: impl FnMut(u64, u64)) -> Result<()> {
     let mut src = File::open(iso).with_context(|| format!("打开 {} 失败", iso.display()))?;
     let total = src.metadata()?.len();
 
     let mut dst = OpenOptions::new()
         .write(true)
+        .custom_flags(libc::O_EXCL)
         .open(blk)
         .with_context(|| format!("打开 {} 失败(需要 disk 组权限)", blk.display()))?;
 
@@ -151,47 +152,13 @@ fn sha256_file(p: &Path) -> Result<Vec<u8>> {
 }
 
 /// 校验:设备前 `len` 字节是否与 ISO 完全一致
-pub fn verify_iso(
-    blk: &Path,
-    iso: &Path,
-    mut progress: impl FnMut(u64, u64),
-) -> Result<bool> {
+pub fn verify_iso(blk: &Path, iso: &Path, mut progress: impl FnMut(u64, u64)) -> Result<bool> {
     let len = std::fs::metadata(iso)?.len();
     let a = sha256_file(iso)?;
     // 读之前先丢弃缓存,确保 O_DIRECT 拿到的是真实设备内容
     let _ = drop_cache(blk);
     let b = sha256_odirect(blk, len, &mut progress)?;
     Ok(a == b)
-}
-
-/// 计算目录/文件集合的总大小(用于空间估算)
-pub fn total_size(paths: &[std::path::PathBuf]) -> u64 {
-    fn walk(p: &Path, acc: &mut u64) {
-        if let Ok(m) = std::fs::symlink_metadata(p) {
-            if m.is_dir() {
-                if let Ok(rd) = std::fs::read_dir(p) {
-                    for e in rd.flatten() {
-                        walk(&e.path(), acc);
-                    }
-                }
-            } else {
-                *acc = acc.saturating_add(m.len());
-            }
-        }
-    }
-    let mut acc = 0;
-    for p in paths {
-        walk(p, &mut acc);
-    }
-    acc
-}
-
-/// ISO 结构开销估算:按扇区对齐 + 约 1% 余量
-pub fn estimate_iso_size(data_bytes: u64, entries: u64) -> u64 {
-    let overhead_dirs = entries.saturating_mul(64);
-    let base = data_bytes.saturating_add(overhead_dirs).saturating_add(1024 * 1024);
-    let with_ratio = base + base / 100 * 1;
-    (with_ratio + 2047) / 2048 * 2048
 }
 
 /// 递归收集一组路径下所有文件的 (大小, SHA-256)。
@@ -208,12 +175,9 @@ pub fn hash_tree(paths: &[std::path::PathBuf]) -> Result<Vec<(u64, String)>> {
 }
 
 fn hash_walk(p: &Path, out: &mut Vec<(u64, String)>) -> Result<()> {
-    let meta = match std::fs::symlink_metadata(p) {
-        Ok(m) => m,
-        Err(_) => return Ok(()),
-    };
+    let meta = std::fs::symlink_metadata(p).with_context(|| format!("无法读取 {}", p.display()))?;
     if meta.is_dir() {
-        let mut entries: Vec<_> = std::fs::read_dir(p)?.flatten().collect();
+        let mut entries: Vec<_> = std::fs::read_dir(p)?.collect::<std::io::Result<_>>()?;
         entries.sort_by_key(|e| e.file_name());
         for e in entries {
             hash_walk(&e.path(), out)?;
@@ -231,39 +195,4 @@ fn hex(b: &[u8]) -> String {
         s.push_str(&format!("{x:02x}"));
     }
     s
-}
-
-/// 核对两个文件集合是否完全一致(按 大小+哈希 的多重集合比较)
-pub fn compare_sets(
-    src: &[(u64, String)],
-    dst: &[(u64, String)],
-) -> (usize, Vec<String>) {
-    let mut problems = Vec::new();
-    let mut a = src.to_vec();
-    let mut b = dst.to_vec();
-    a.sort();
-    b.sort();
-
-    // 多出来的(源里有、盘上没有)
-    let mut bi = 0usize;
-    for item in &a {
-        while bi < b.len() && b[bi] < *item {
-            bi += 1;
-        }
-        if bi < b.len() && b[bi] == *item {
-            bi += 1;
-            continue;
-        }
-        problems.push(format!(
-            "缺少或内容不符:{} 字节,哈希 {}…",
-            item.0,
-            &item.1[..12.min(item.1.len())]
-        ));
-        if problems.len() >= 8 {
-            break;
-        }
-    }
-
-    let matched = src.len().min(dst.len()).saturating_sub(problems.len());
-    (matched, problems)
 }

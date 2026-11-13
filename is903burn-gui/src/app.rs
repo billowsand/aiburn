@@ -1,508 +1,357 @@
-//! egui 界面。
-
-use crate::burn;
 use crate::device::{self, Device};
 use crate::job::{self, Job, Msg};
-use eframe::egui;
+use eframe::egui::{self, Align, Color32, RichText};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-const STAGE_IDLE: &str = "就绪";
+const BACKGROUND: Color32 = Color32::from_rgb(18, 23, 30);
+const SURFACE: Color32 = Color32::from_rgb(27, 34, 44);
+const BORDER: Color32 = Color32::from_rgb(47, 59, 72);
+const MUTED: Color32 = Color32::from_rgb(163, 178, 193);
+const ACCENT: Color32 = Color32::from_rgb(93, 224, 193);
+const ERROR: Color32 = Color32::from_rgb(255, 152, 143);
 
 pub struct App {
     devices: Vec<Device>,
-    sel: usize,
+    selected: usize,
     sources: Vec<PathBuf>,
     label: String,
-    label_touched: bool,
-    log: Vec<String>,
+    access_error: Option<String>,
+    confirmation: Option<Device>,
     job: Option<Job>,
+    result: Option<Result<job::JobOk, String>>,
     stage: String,
-    frac: f32,
-    busy: bool,
-    confirm_open: bool,
+    progress: f32,
+    log: Vec<String>,
+    show_log: bool,
     last_scan: Instant,
-    last_ok: Option<job::JobOk>,
-    started: Option<Instant>,
 }
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        install_fonts(&cc.egui_ctx);
-        let devices = device::scan();
-        Self {
-            devices,
-            sel: 0,
+        let ctx = &cc.egui_ctx;
+        install_fonts(ctx);
+        let mut visuals = egui::Visuals::dark();
+        visuals.panel_fill = BACKGROUND;
+        visuals.window_fill = SURFACE;
+        visuals.extreme_bg_color = BACKGROUND;
+        visuals.override_text_color = Some(Color32::from_rgb(229, 237, 245));
+        visuals.weak_text_color = Some(MUTED);
+        visuals.selection.bg_fill = Color32::from_rgb(36, 95, 89);
+        ctx.set_visuals(visuals);
+        ctx.global_style_mut(|style| {
+            style.spacing.item_spacing = egui::vec2(8.0, 8.0);
+            style.spacing.button_padding = egui::vec2(10.0, 5.0);
+            style.spacing.interact_size.y = 28.0;
+            for widget in [
+                &mut style.visuals.widgets.inactive,
+                &mut style.visuals.widgets.hovered,
+                &mut style.visuals.widgets.active,
+            ] {
+                widget.corner_radius = 6.into();
+            }
+        });
+        let mut app = Self {
+            devices: Vec::new(),
+            selected: 0,
             sources: Vec::new(),
             label: String::new(),
-            label_touched: false,
-            log: vec!["欢迎使用 IS903 烧录工具".to_string()],
+            access_error: None,
+            confirmation: None,
             job: None,
-            stage: STAGE_IDLE.to_string(),
-            frac: 0.0,
-            busy: false,
-            confirm_open: false,
+            result: None,
+            stage: String::new(),
+            progress: 0.0,
+            log: Vec::new(),
+            show_log: false,
             last_scan: Instant::now(),
-            last_ok: None,
-            started: None,
-        }
-    }
-
-    fn push_log(&mut self, s: impl Into<String>) {
-        let s = s.into();
-        self.log.push(s);
-        if self.log.len() > 500 {
-            self.log.remove(0);
-        }
+        };
+        app.refresh_devices();
+        app
     }
 
     fn current(&self) -> Option<&Device> {
-        self.devices.get(self.sel)
+        self.devices.get(self.selected)
     }
 
-    fn data_bytes(&self) -> u64 {
-        burn::total_size(&self.sources)
+    fn refresh_devices(&mut self) {
+        let devices = device::scan();
+        self.selected = self
+            .current()
+            .and_then(|current| devices.iter().position(|d| d.same_device(current)))
+            .unwrap_or(0);
+        self.devices = devices;
+        self.check_access();
+        self.last_scan = Instant::now();
     }
 
-    fn entry_count(&self) -> u64 {
-        fn count(p: &std::path::Path, acc: &mut u64) {
-            if let Ok(m) = std::fs::symlink_metadata(p) {
-                *acc += 1;
-                if m.is_dir() {
-                    if let Ok(rd) = std::fs::read_dir(p) {
-                        for e in rd.flatten() {
-                            count(&e.path(), acc);
-                        }
-                    }
+    fn check_access(&mut self) {
+        self.access_error = self
+            .current()
+            .and_then(|d| d.check_access().err())
+            .map(|e| format!("{e:#}"));
+    }
+
+    fn poll_job(&mut self) {
+        use std::sync::mpsc::TryRecvError;
+        let Some(job) = &self.job else { return };
+        let result = loop {
+            match job.rx.try_recv() {
+                Ok(Msg::Progress { stage, frac }) => {
+                    self.stage = stage;
+                    self.progress = frac;
                 }
+                Ok(Msg::Log(line)) => self.log.push(line),
+                Ok(Msg::Done(result)) => break result,
+                Err(TryRecvError::Empty) => return,
+                Err(TryRecvError::Disconnected) => break Err("烧录任务意外退出".into()),
+            }
+        };
+        if let Err(error) = &result {
+            self.log.push(error.clone());
+        }
+        self.result = Some(result);
+        self.job = None;
+        self.refresh_devices();
+    }
+
+    fn add_sources(&mut self, paths: impl IntoIterator<Item = PathBuf>) {
+        for path in paths {
+            if path.exists() && !self.sources.contains(&path) {
+                self.sources.push(path);
             }
         }
-        let mut n = 0;
-        for p in &self.sources {
-            count(p, &mut n);
-        }
-        n
-    }
-
-    fn est_iso(&self) -> u64 {
-        if self.sources.is_empty() {
-            return 0;
-        }
-        burn::estimate_iso_size(self.data_bytes(), self.entry_count())
     }
 
     fn default_label(&self) -> String {
-        let base = self
+        let label: String = self
             .sources
             .first()
-            .and_then(|p| p.file_name())
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| "DATA".to_string());
-        let up: String = base
-            .chars()
-            .map(|c| {
-                let u = c.to_ascii_uppercase();
-                if u.is_ascii_alphanumeric() || u == '_' || u == '-' {
-                    u
-                } else {
-                    '_'
-                }
-            })
-            .collect();
-        let mut s: String = up.chars().take(32).collect();
-        if s.is_empty() {
-            s = "DATA".into();
-        }
-        s
-    }
-
-    fn poll_job(&mut self, ctx: &egui::Context) {
-        let mut done: Option<Result<job::JobOk, String>> = None;
-        if let Some(job) = &self.job {
-            while let Ok(m) = job.rx.try_recv() {
-                match m {
-                    Msg::Log(s) => self.log.push(s),
-                    Msg::Progress { stage, frac } => {
-                        self.stage = stage;
-                        self.frac = frac;
-                    }
-                    Msg::Done(r) => done = Some(r),
-                }
-            }
-        }
-        if self.log.len() > 500 {
-            let n = self.log.len() - 500;
-            self.log.drain(0..n);
-        }
-        if let Some(r) = done {
-            self.job = None;
-            self.busy = false;
-            self.frac = 1.0;
-            match r {
-                Ok(ok) => {
-                    let secs = self
-                        .started
-                        .take()
-                        .map(|t| t.elapsed().as_secs_f64())
-                        .unwrap_or(ok.secs);
-                    self.stage = "烧录成功".into();
-                    self.push_log(format!(
-                        "✔ 完成:{} 个文件 / {} 个目录,{} ({} 扇区),耗时 {:.1} 秒",
-                        ok.files,
-                        ok.dirs,
-                        device::human_size(ok.iso_bytes),
-                        ok.iso_sectors,
-                        secs
-                    ));
-                    if let Some(mp) = &ok.mount_point {
-                        self.push_log(format!("✔ 已挂载:{}", mp.display()));
-                    }
-                    if let Some((n, probs)) = &ok.file_check {
-                        if probs.is_empty() {
-                            self.stage = "烧录成功(已核对)".into();
+            .and_then(|p| p.file_stem())
+            .map(|name| {
+                name.to_string_lossy()
+                    .chars()
+                    .map(|c| {
+                        let upper = c.to_ascii_uppercase();
+                        if upper.is_ascii_alphanumeric() {
+                            upper
                         } else {
-                            self.stage = "烧录完成,但有文件不一致".into();
-                            self.push_log(format!("⚠ {} 个文件不一致", probs.len()));
+                            '_'
                         }
-                        self.push_log(format!("✔ 文件核对: {n} 个文件内容一致"));
-                    }
-                    self.last_ok = Some(ok);
-                }
-                Err(e) => {
-                    self.started = None;
-                    self.stage = "失败".into();
-                    self.push_log(format!("✘ 失败:{e}"));
-                }
-            }
-        }
-        if self.busy {
-            ctx.request_repaint_after(Duration::from_millis(100));
+                    })
+                    .take(16)
+                    .collect()
+            })
+            .unwrap_or_default();
+        if label.trim_matches('_').is_empty() {
+            "DATA".into()
+        } else {
+            label
         }
     }
 
-    fn start_burn(&mut self, ctx: &egui::Context) {
-        let Some(dev) = self.current() else { return };
-        let blk = dev.node.clone();
-        let label = if self.label.trim().is_empty() {
+    fn volume_label(&self) -> String {
+        if self.label.trim().is_empty() {
             self.default_label()
         } else {
-            self.label.trim().to_string()
-        };
-        let sources = self.sources.clone();
-
-        self.busy = true;
-        self.confirm_open = false;
-        self.frac = 0.0;
-        self.stage = "准备中".into();
-        self.last_ok = None;
-        self.started = Some(Instant::now());
-        self.push_log(format!(
-            "开始烧录 → {} 卷标 {}",
-            blk.display(),
-            label
-        ));
-        self.job = Some(job::spawn(blk, sources, label, Some(ctx.clone())));
-    }
-
-    fn ui_device(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.label("烧录设备:");
-            let cur_text = self
-                .current()
-                .map(|d| d.title())
-                .unwrap_or_else(|| "未检测到 IS903 设备".to_string());
-
-            let mut new_sel = self.sel;
-            egui::ComboBox::from_id_salt("devsel")
-                .width(420.0)
-                .selected_text(cur_text)
-                .show_ui(ui, |ui| {
-                    for (i, d) in self.devices.iter().enumerate() {
-                        ui.selectable_value(&mut new_sel, i, d.title());
-                    }
-                });
-            if new_sel != self.sel {
-                self.sel = new_sel;
-            }
-            if ui.button("刷新").clicked() {
-                self.devices = device::scan();
-                if self.sel >= self.devices.len() {
-                    self.sel = 0;
-                }
-                self.last_scan = Instant::now();
-            }
-
-        });
-
-        // 设备状态提示
-        match self.current() {
-            None => {
-                ui.colored_label(
-                    egui::Color32::from_rgb(220, 80, 80),
-                    "✘ 没有找到 Innostor IS903 设备。请插好设备,并确认已加载 sg 模块。",
-                );
-            }
-            Some(d) => {
-                // 只对可写的块设备做权限预检;光驱模式走 SG_IO,不需要 disk 组
-                if d.is_writable() && !can_write(&d.node) {
-                    ui.colored_label(
-                        egui::Color32::from_rgb(220, 160, 60),
-                        "⚠ 没有写权限。把自己加入 disk 组(重新登录生效)即可。",
-                    );
-                } else {
-                    ui.colored_label(
-                        egui::Color32::from_rgb(90, 180, 110),
-                        "✔ 已就绪",
-                    );
-                }
-            }
+            self.label.trim().to_owned()
         }
     }
 
-    fn ui_sources(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.heading("烧录内容");
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .add_enabled(!self.busy && !self.sources.is_empty(), egui::Button::new("清空"))
-                    .clicked()
-                {
-                    self.sources.clear();
-                    if !self.label_touched {
-                        self.label.clear();
-                    }
-                }
-                if ui
-                    .add_enabled(!self.busy, egui::Button::new("添加文件夹"))
-                    .clicked()
-                {
-                    if let Some(p) = rfd::FileDialog::new().pick_folder() {
-                        self.sources.push(p);
-                        self.after_add();
-                    }
-                }
-                if ui
-                    .add_enabled(!self.busy, egui::Button::new("添加文件"))
-                    .clicked()
-                {
-                    if let Some(ps) = rfd::FileDialog::new().pick_files() {
-                        for p in ps {
-                            self.sources.push(p);
+    fn device_ui(&mut self, ui: &mut egui::Ui) {
+        card(ui, |ui| {
+            ui.label(RichText::new("目标设备").strong());
+            let title = self
+                .current()
+                .map(Device::title)
+                .unwrap_or_else(|| "未检测到 IS903".into());
+            let previous = self.selected;
+            ui.horizontal(|ui| {
+                egui::ComboBox::from_id_salt("device")
+                    .width((ui.available_width() - 72.0).max(170.0))
+                    .selected_text(title)
+                    .show_ui(ui, |ui| {
+                        for (index, d) in self.devices.iter().enumerate() {
+                            ui.selectable_value(&mut self.selected, index, d.title());
                         }
-                        self.after_add();
-                    }
+                    });
+                if ui.button("刷新").clicked() {
+                    self.refresh_devices();
                 }
             });
+            if self.selected != previous {
+                self.check_access();
+            }
+            if let Some(error) = &self.access_error {
+                ui.colored_label(ERROR, error);
+            }
         });
+    }
 
-        if self.sources.is_empty() {
-            ui.add_space(6.0);
-            ui.weak("还没有添加内容。点击右上角「添加文件」或「添加文件夹」。");
-            return;
-        }
+    fn sources_ui(&mut self, ui: &mut egui::Ui) {
+        card(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("烧录内容").strong());
+                ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                    if ui.button("添加文件夹").clicked() {
+                        self.add_sources(rfd::FileDialog::new().pick_folder());
+                    }
+                    if ui.button("添加文件").clicked() {
+                        self.add_sources(rfd::FileDialog::new().pick_files().unwrap_or_default());
+                    }
+                });
+            });
+            egui::Frame::new()
+                .fill(BACKGROUND)
+                .corner_radius(8)
+                .inner_margin(8)
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    if self.sources.is_empty() {
+                        ui.vertical_centered(|ui| {
+                            ui.add_space(19.0);
+                            ui.label(RichText::new("拖入文件或文件夹").color(MUTED));
+                            ui.add_space(19.0);
+                        });
+                        return;
+                    }
 
-        let mut remove: Option<usize> = None;
-        egui::ScrollArea::vertical()
-            .id_salt("srcs")
-            .max_height(180.0)
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                for (i, p) in self.sources.iter().enumerate() {
-                    ui.horizontal(|ui| {
-                        let is_dir = p.is_dir();
-                        let (size, nfiles) = dir_stat(p);
-                        let icon = if is_dir { "📁" } else { "📄" };
-                        let name = p
-                            .file_name()
-                            .map(|s| s.to_string_lossy().to_string())
-                            .unwrap_or_else(|| p.display().to_string());
-                        ui.label(icon);
-                        ui.label(egui::RichText::new(name).strong());
-                        if is_dir {
-                            ui.weak(format!("{} 个文件", nfiles));
-                        }
-                        ui.weak(device::human_size(size));
-                        if ui
-                            .add_enabled(!self.busy, egui::Button::new("移除").small())
-                            .clicked()
-                        {
-                            remove = Some(i);
-                        }
+                    let mut remove = None;
+                    egui::ScrollArea::vertical()
+                        .id_salt("sources")
+                        .max_height(106.0)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            for (index, source) in self.sources.iter().enumerate() {
+                                ui.horizontal(|ui| {
+                                    let name = source
+                                        .file_name()
+                                        .unwrap_or(source.as_os_str())
+                                        .to_string_lossy();
+                                    let text = egui::Label::new(name.as_ref()).truncate();
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(Align::Center),
+                                        |ui| {
+                                            if ui.small_button("移除").clicked() {
+                                                remove = Some(index);
+                                            }
+                                            ui.allocate_ui_with_layout(
+                                                egui::vec2(ui.available_width(), 26.0),
+                                                egui::Layout::left_to_right(Align::Center),
+                                                |ui| {
+                                                    ui.add(text)
+                                                        .on_hover_text(source.display().to_string())
+                                                },
+                                            );
+                                        },
+                                    );
+                                });
+                            }
+                        });
+                    if let Some(index) = remove {
+                        self.sources.remove(index);
+                    }
+                });
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("卷标").color(MUTED));
+                let default = self.default_label();
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.label)
+                        .hint_text(default)
+                        .desired_width(145.0)
+                        .char_limit(16),
+                );
+                if !self.sources.is_empty() {
+                    ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                        ui.weak(format!("{} 项来源", self.sources.len()));
                     });
                 }
             });
-        if let Some(i) = remove {
-            self.sources.remove(i);
-            if self.sources.is_empty() && !self.label_touched {
-                self.label.clear();
-            }
-        }
+        });
     }
 
-    fn after_add(&mut self) {
-        if !self.label_touched || self.label.is_empty() {
-            self.label = self.default_label();
-        }
-    }
-
-    fn ui_space(&mut self, ui: &mut egui::Ui) {
-        let data = self.data_bytes();
-        let est = self.est_iso();
-        let cap = self.current().map(|d| d.capacity).unwrap_or(0);
-
-        ui.horizontal(|ui| {
-            ui.label("卷标:");
-            let r = ui.add(
-                egui::TextEdit::singleline(&mut self.label)
-                    .desired_width(200.0)
-                    .hint_text("自动生成"),
+    fn status_ui(&mut self, ui: &mut egui::Ui) {
+        if self.job.is_some() {
+            ui.label(RichText::new(&self.stage).strong());
+            ui.add(
+                egui::ProgressBar::new(self.progress)
+                    .desired_height(14.0)
+                    .fill(ACCENT)
+                    .show_percentage(),
             );
-            if r.changed() {
-                self.label_touched = true;
-            }
-            if ui.button("重置").clicked() {
-                self.label = self.default_label();
-                self.label_touched = false;
-            }
-        });
-
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            ui.label("已选内容:");
-            ui.monospace(device::human_size(data));
-            ui.separator();
-            ui.label("预计 ISO:");
-            ui.monospace(device::human_size(est));
-            ui.separator();
-            ui.label("设备容量:");
-            ui.monospace(if cap > 0 {
-                device::human_size(cap)
-            } else {
-                "未知".into()
-            });
-        });
-
-        let over = cap > 0 && est > cap;
-        let frac = if cap > 0 {
-            (est as f32 / cap as f32).clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
-        let bar = egui::ProgressBar::new(frac)
-            .desired_height(18.0)
-            .text(if cap > 0 {
-                format!("{:.2}%", frac * 100.0)
-            } else {
-                "—".into()
-            });
-        ui.add(bar.fill(if over {
-            egui::Color32::from_rgb(200, 70, 70)
-        } else {
-            egui::Color32::from_rgb(70, 140, 200)
-        }));
-
-        if over {
-            ui.colored_label(
-                egui::Color32::from_rgb(220, 80, 80),
-                format!(
-                    "✘ 超出设备容量 {} —— 请减少内容",
-                    device::human_size(est - cap)
-                ),
-            );
-        } else if cap > 0 && est > 0 {
-            ui.weak(format!("剩余空间 {}", device::human_size(cap - est)));
-        }
-    }
-
-    fn ui_bottom(&mut self, ui: &mut egui::Ui, _ctx: &egui::Context) {
-        ui.add_space(4.0);
-        ui.add(
-            egui::ProgressBar::new(self.frac)
-                .desired_height(20.0)
-                .text(format!("{}  {:.0}%", self.stage, self.frac * 100.0)),
-        );
-        ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            // 只要识别到 IS903 就允许烧录;具体走哪条写入路径由后台决定
-            let dev_ok = self.current().is_some();
-            let cap = self.current().map(|d| d.capacity).unwrap_or(0);
-            let fits = cap == 0 || self.est_iso() <= cap;
-            let ready = dev_ok && !self.sources.is_empty() && fits && !self.busy;
-
-            let btn = egui::Button::new(egui::RichText::new("开始烧录").size(16.0).strong())
-                .min_size(egui::vec2(140.0, 34.0));
-            if ui.add_enabled(ready, btn).clicked() {
-                self.confirm_open = true;
-            }
-
-            if self.busy {
-                ui.spinner();
-                ui.label("进行中…");
-            } else if !dev_ok {
-                ui.weak("未检测到设备");
-            } else if self.sources.is_empty() {
-                ui.weak("请先添加要烧录的内容");
-            } else if !fits {
-                ui.weak("容量不足");
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if let Some(ok) = &self.last_ok {
-                    if let Some(mp) = &ok.mount_point {
-                        ui.weak(format!("已挂载: {}", mp.display()));
-                    }
-                }
-            });
-        });
-
-        // 日志
-        ui.add_space(4.0);
-        egui::ScrollArea::vertical()
-            .id_salt("log")
-            .max_height(120.0)
-            .auto_shrink([false, false])
-            .stick_to_bottom(true)
-            .show(ui, |ui| {
-                for line in &self.log {
-                    ui.monospace(line);
-                }
-            });
-    }
-
-    fn ui_confirm(&mut self, ctx: &egui::Context) {
-        if !self.confirm_open {
             return;
         }
-        let mut open = true;
-        egui::Window::new("确认烧录")
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .open(&mut open)
-            .show(ctx, |ui| {
-                ui.label("即将覆盖设备上的全部数据,此操作不可撤销。");
-                ui.add_space(6.0);
-                if let Some(d) = self.current() {
-                    ui.monospace(format!("设备: {}", d.node.display()));
-                    ui.monospace(format!("容量: {}", device::human_size(d.capacity)));
+        if let Some(result) = &self.result {
+            match result {
+                Ok(ok) => {
+                    ui.colored_label(
+                        ACCENT,
+                        RichText::new("烧录完成 · 整盘及文件已核验").strong(),
+                    );
+                    ui.horizontal_wrapped(|ui| {
+                        ui.weak(format!(
+                            "{} 个文件 · {} · {:.1} 秒",
+                            ok.files,
+                            device::human_size(ok.iso_bytes),
+                            ok.secs
+                        ));
+                        if ui.button("打开光驱").clicked() {
+                            match std::process::Command::new("xdg-open")
+                                .arg(&ok.mount_point)
+                                .spawn()
+                            {
+                                Ok(mut child) => {
+                                    std::thread::spawn(move || {
+                                        let _ = child.wait();
+                                    });
+                                }
+                                Err(e) => {
+                                    self.log.push(format!("无法打开挂载目录：{e}"));
+                                    self.show_log = true;
+                                }
+                            }
+                        }
+                    });
                 }
-                ui.monospace(format!("卷标: {}", self.label));
-                ui.monospace(format!("大小: {}", device::human_size(self.est_iso())));
-                ui.add_space(10.0);
-                ui.horizontal(|ui| {
-                    let go = egui::Button::new(
-                        egui::RichText::new("确认烧录").strong(),
-                    )
-                    .fill(egui::Color32::from_rgb(180, 70, 70));
-                    if ui.add(go).clicked() {
-                        self.start_burn(ctx);
-                    }
-                    if ui.button("取消").clicked() {
-                        self.confirm_open = false;
-                    }
-                });
+                Err(error) => {
+                    ui.colored_label(ERROR, RichText::new("烧录未完成").strong());
+                    ui.label(error);
+                }
+            }
+        }
+    }
+
+    fn confirm_ui(&mut self, ctx: &egui::Context) {
+        let Some(target) = self.confirmation.clone() else {
+            return;
+        };
+        let label = self.volume_label();
+        let mut start = false;
+        let mut cancel = false;
+        let modal = egui::Modal::new(egui::Id::unique("confirm-burn")).show(ctx, |ui| {
+            ui.set_width(300.0);
+            ui.heading("覆盖目标光盘？");
+            ui.label(target.title());
+            ui.weak(format!("卷标 {label} · {} 项来源", self.sources.len()));
+            ui.label("烧录会覆盖设备上的现有内容。");
+            ui.horizontal(|ui| {
+                if ui.button("取消").clicked() {
+                    cancel = true;
+                }
+                if ui.add(primary("确认烧录")).clicked() {
+                    start = true;
+                }
             });
-        if !open {
-            self.confirm_open = false;
+        });
+        if start {
+            self.result = None;
+            self.log.clear();
+            self.stage = "准备烧录".into();
+            self.progress = 0.0;
+            self.job = Some(job::spawn(target, self.sources.clone(), label, ctx.clone()));
+        }
+        if start || cancel || modal.should_close() {
+            self.confirmation = None;
         }
     }
 }
@@ -510,78 +359,120 @@ impl App {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-
-        // 定时重扫设备(1.5 秒),处理热插拔与模式切换
-        if self.last_scan.elapsed() > Duration::from_millis(1500) {
-            let new = device::scan();
-            let changed = new.len() != self.devices.len()
-                || new
-                    .iter()
-                    .zip(self.devices.iter())
-                    .any(|(a, b)| a.node != b.node || a.scsi_type != b.scsi_type);
-            if changed {
-                if let Some(cur) = self.current().map(|d| d.node.clone()) {
-                    self.sel = new.iter().position(|d| d.node == cur).unwrap_or(0);
-                }
-                if self.sel >= new.len() {
-                    self.sel = 0;
-                }
-                self.devices = new;
+        self.poll_job();
+        let busy = self.job.is_some();
+        if busy && ctx.input(|i| i.viewport().close_requested()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        }
+        if !busy && self.confirmation.is_none() {
+            if self.last_scan.elapsed() >= Duration::from_millis(1500) {
+                self.refresh_devices();
             }
-            self.last_scan = Instant::now();
+            ctx.request_repaint_after(Duration::from_millis(1500));
+            let dropped = ctx.input(|i| i.raw.dropped_files.clone());
+            self.add_sources(dropped.into_iter().map(|f| f.path().to_path_buf()));
         }
 
-        self.poll_job(&ctx);
-
-        egui::Panel::top("top").show(ui, |ui| {
-            ui.add_space(6.0);
-            ui.heading("IS903 烧录工具");
-            ui.add_space(6.0);
-            self.ui_device(ui);
-            ui.add_space(4.0);
-        });
-
-        egui::Panel::bottom("bottom").show(ui, |ui| {
-            self.ui_bottom(ui, &ctx);
-            ui.add_space(6.0);
-        });
-
-        egui::CentralPanel::default().show(ui, |ui| {
-            self.ui_sources(ui);
-            ui.add_space(10.0);
-            ui.separator();
-            ui.add_space(10.0);
-            self.ui_space(ui);
-        });
-
-        self.ui_confirm(&ctx);
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(BACKGROUND).inner_margin(16))
+            .show(ui, |ui| {
+                let width = ui.available_width().min(468.0);
+                ui.vertical_centered(|ui| {
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(width, ui.available_height()),
+                        egui::Layout::top_down(Align::Min),
+                        |ui| {
+                            ui.set_width(width);
+                            ui.horizontal(|ui| {
+                                let (rect, _) = ui.allocate_exact_size(
+                                    egui::vec2(34.0, 34.0),
+                                    egui::Sense::hover(),
+                                );
+                                ui.painter()
+                                    .rect_filled(rect, 9.0, Color32::from_rgb(31, 66, 64));
+                                ui.painter().circle_stroke(
+                                    rect.center(),
+                                    10.0,
+                                    egui::Stroke::new(1.5, ACCENT),
+                                );
+                                ui.painter().circle_stroke(
+                                    rect.center(),
+                                    3.0,
+                                    egui::Stroke::new(1.5, ACCENT),
+                                );
+                                ui.label(RichText::new("IS903 烧录工具").size(21.0).strong());
+                            });
+                            ui.add_space(4.0);
+                            egui::ScrollArea::vertical()
+                                .id_salt("main")
+                                .auto_shrink([false, true])
+                                .show(ui, |ui| {
+                                    ui.add_enabled_ui(!busy, |ui| {
+                                        self.device_ui(ui);
+                                        self.sources_ui(ui);
+                                    });
+                                    let ready = !busy
+                                        && self.current().is_some()
+                                        && self.access_error.is_none()
+                                        && !self.sources.is_empty();
+                                    let caption = if busy {
+                                        "烧录进行中"
+                                    } else {
+                                        "开始烧录"
+                                    };
+                                    ui.vertical_centered_justified(|ui| {
+                                        if ui
+                                            .add_enabled(
+                                                ready,
+                                                primary(caption).min_size(egui::vec2(0.0, 36.0)),
+                                            )
+                                            .clicked()
+                                        {
+                                            self.confirmation = self.current().cloned();
+                                        }
+                                    });
+                                    self.status_ui(ui);
+                                    if !self.log.is_empty() {
+                                        ui.toggle_value(&mut self.show_log, "查看详情");
+                                        if self.show_log {
+                                            egui::ScrollArea::vertical()
+                                                .id_salt("log")
+                                                .max_height(86.0)
+                                                .stick_to_bottom(true)
+                                                .show(ui, |ui| {
+                                                    for line in &self.log {
+                                                        ui.label(
+                                                            RichText::new(line)
+                                                                .small()
+                                                                .color(MUTED),
+                                                        );
+                                                    }
+                                                });
+                                        }
+                                    }
+                                });
+                        },
+                    );
+                });
+            });
+        self.confirm_ui(&ctx);
     }
 }
 
-fn dir_stat(p: &std::path::Path) -> (u64, u64) {
-    fn walk(p: &std::path::Path, size: &mut u64, n: &mut u64) {
-        if let Ok(m) = std::fs::metadata(p) {
-            if m.is_dir() {
-                if let Ok(rd) = std::fs::read_dir(p) {
-                    for e in rd.flatten() {
-                        walk(&e.path(), size, n);
-                    }
-                }
-            } else {
-                *size += m.len();
-                *n += 1;
-            }
-        }
-    }
-    let mut s = 0;
-    let mut n = 0;
-    walk(p, &mut s, &mut n);
-    (s, n)
+fn card(ui: &mut egui::Ui, contents: impl FnOnce(&mut egui::Ui)) {
+    egui::Frame::new()
+        .fill(SURFACE)
+        .stroke(egui::Stroke::new(1.0, BORDER))
+        .corner_radius(11)
+        .inner_margin(12)
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            contents(ui);
+        });
 }
 
-/// 试着以写方式打开设备(不会写入任何数据),判断权限是否足够
-fn can_write(p: &std::path::Path) -> bool {
-    std::fs::OpenOptions::new().write(true).open(p).is_ok()
+fn primary(label: &str) -> egui::Button<'_> {
+    egui::Button::new(RichText::new(label).color(BACKGROUND).strong()).fill(ACCENT)
 }
 
 /// 加载中文字体(egui 默认字体不含 CJK)
@@ -620,10 +511,8 @@ fn install_fonts(ctx: &egui::Context) {
         if let Some((file, idx)) = s.rsplit_once(':') {
             if let Ok(bytes) = std::fs::read(file) {
                 let mut fonts = egui::FontDefinitions::default();
-                let data = egui::FontData::from_blob(
-                    std::sync::Arc::new(bytes),
-                    idx.parse().unwrap_or(0),
-                );
+                let data =
+                    egui::FontData::from_blob(std::sync::Arc::new(bytes), idx.parse().unwrap_or(0));
                 fonts
                     .font_data
                     .insert("cjk".to_owned(), std::sync::Arc::new(data));

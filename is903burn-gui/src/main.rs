@@ -1,7 +1,4 @@
 //! IS903 烧录工具 —— 图形界面
-//!
-//! 烧录后端使用已实测可行的路径:把 ISO 原样写入块设备偏移 0,
-//! 再用 O_DIRECT 回读校验,确保数据真实落到闪存。
 
 mod app;
 mod burn;
@@ -12,7 +9,6 @@ mod mount;
 mod sg;
 
 fn main() -> eframe::Result<()> {
-    // 无参数时走命令行自检,方便脱离界面验证 ISO 生成
     let a: Vec<String> = std::env::args().collect();
     if a.len() >= 2 {
         let code = match cli(&a) {
@@ -27,8 +23,9 @@ fn main() -> eframe::Result<()> {
 
     let opts = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
-            .with_inner_size([900.0, 720.0])
-            .with_min_inner_size([720.0, 560.0])
+            .with_inner_size([460.0, 420.0])
+            .with_min_inner_size([400.0, 390.0])
+            .with_app_id("is903burn-gui")
             .with_title("IS903 烧录工具"),
         ..Default::default()
     };
@@ -89,6 +86,7 @@ fn cli(a: &[String]) -> anyhow::Result<i32> {
                 &srcs,
                 &label,
                 std::path::Path::new(&out),
+                u64::MAX,
                 &mut |done, total| {
                     if done == total {
                         eprintln!("  {done}/{total}");
@@ -127,23 +125,35 @@ fn cli(a: &[String]) -> anyhow::Result<i32> {
                 eprintln!("用法: --burn <块设备> -l <卷标> <来源…>");
                 return Ok(2);
             }
+            let node = std::fs::canonicalize(&blk)?;
+            let target = device::scan()
+                .into_iter()
+                .find(|d| d.node == node)
+                .ok_or_else(|| anyhow::anyhow!("{} 不是已识别的 IS903 设备", node.display()))?;
             let (tx, rx) = std::sync::mpsc::channel();
-            let r = job::run(std::path::Path::new(&blk), &srcs, &label, &tx, None);
-            for m in rx.try_iter() {
-                match m {
-                    job::Msg::Log(s) => println!("{s}"),
-                    job::Msg::Progress { stage, frac } => {
-                        println!("[{:>5.1}%] {stage}", frac * 100.0)
+            let r = std::thread::scope(|scope| {
+                let worker = scope.spawn(move || job::run(&target, &srcs, &label, &tx, None));
+                for m in rx {
+                    match m {
+                        job::Msg::Log(s) => println!("{s}"),
+                        job::Msg::Progress { stage, frac } => {
+                            println!("[{:>5.1}%] {stage}", frac * 100.0)
+                        }
+                        job::Msg::Done(_) => {}
                     }
-                    job::Msg::Done(_) => {}
                 }
-            }
+                worker
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("烧录任务意外退出"))?
+            });
             match r {
                 Ok(ok) => {
                     println!(
                         "✔ 成功: {} 个文件 / {} 个目录, {} ({} 扇区)",
-                        ok.files, ok.dirs,
-                        device::human_size(ok.iso_bytes), ok.iso_sectors
+                        ok.files,
+                        ok.dirs,
+                        device::human_size(ok.iso_bytes),
+                        ok.iso_sectors
                     );
                     Ok(0)
                 }

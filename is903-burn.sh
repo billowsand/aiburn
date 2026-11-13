@@ -178,13 +178,21 @@ ok "来源: $SRC ($SRC_TYPE)"
 step "检测 IS903 设备"
 
 detect_device() {
-	local d name vendor type
+	local d name vendor type parent
 	for d in /sys/block/sd* /sys/block/sr*; do
 		[ -d "$d" ] || continue
 		vendor=$(cat "$d/device/vendor" 2>/dev/null) || continue
 		case "$vendor" in
 		*Innosto*|*Innostar*) ;;
-		*) continue ;;
+		*)
+			# OEM firmware can replace the SCSI vendor string.
+			parent=$(readlink -f "$d/device") || continue
+			while [[ "$parent" == /sys/devices/* && ! -r "$parent/idVendor" ]]; do
+				parent=${parent%/*}
+			done
+			[ -r "$parent/idVendor" ] && [ -r "$parent/idProduct" ] || continue
+			[ "$(<"$parent/idVendor"):$(<"$parent/idProduct")" = "1f75:0903" ] || continue
+			;;
 		esac
 		name=$(basename "$d")
 		type=$(cat "$d/device/type" 2>/dev/null || echo "?")
@@ -215,11 +223,8 @@ info "SCSI 类型: $DEV_TYPE  (0=大容量存储, 5=CD-ROM)"
 if [ "$DEV_TYPE" != "0" ]; then
 	cat >&2 <<EOF
 
-  设备当前是 CD-ROM 模式(类型 $DEV_TYPE),该模式只读,无法烧录。
-
-  解决办法:把设备拔下再插上,让它以大容量存储模式(类型 0)枚举。
-  插好后确认:
-      cat /sys/class/scsi_generic/sg0/device/type    # 应为 0
+  当前设备的 SCSI 类型是 $DEV_TYPE。本脚本需要以类型 0 枚举的可写块设备。
+  类型 5 是只读 CD-ROM，重新插拔后仍可能保持类型 5。
 
 EOF
 	die "设备模式不支持烧录"

@@ -10,7 +10,7 @@
 
 use anyhow::{bail, Context, Result};
 use std::fs::{self, File};
-use std::io::{BufWriter, Seek, Write};
+use std::io::{BufWriter, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -55,7 +55,10 @@ fn iso_datetime_17(t: SystemTime) -> [u8; 17] {
 }
 
 fn ymdhms(t: SystemTime) -> (i32, u8, u8, u8, u8, u8) {
-    let secs = t.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) as i64;
+    let secs = t
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0) as i64;
     // 简化版公历换算,足够 ISO 使用
     let days = secs.div_euclid(86400);
     let rem = secs.rem_euclid(86400);
@@ -141,8 +144,8 @@ impl Tree {
         nodes.push(root);
 
         for src in srcs {
-            let meta = fs::metadata(src)
-                .with_context(|| format!("无法读取 {}", src.display()))?;
+            let meta =
+                fs::symlink_metadata(src).with_context(|| format!("无法读取 {}", src.display()))?;
             if meta.is_dir() {
                 let mut entries: Vec<_> = fs::read_dir(src)
                     .with_context(|| format!("无法列目录 {}", src.display()))?
@@ -167,15 +170,19 @@ impl Tree {
         for i in 0..self.nodes.len() {
             let children = self.nodes[i].children.clone();
             let mut used_iso: Vec<String> = Vec::new();
-            let mut used_jol: Vec<String> = Vec::new();
+            let mut used_jol = Vec::new();
             for c in children {
                 let is_dir = self.nodes[c].is_dir;
                 let raw = self.nodes[c].name.clone();
 
                 let iso = make_iso_name(&raw, is_dir, &used_iso);
                 let jol = make_joliet_name(&raw, &used_jol, is_dir);
-                used_iso.push(String::from_utf8_lossy(&iso).to_string());
-                used_jol.push(String::from_utf8_lossy(&jol).to_string());
+                used_iso.push(
+                    String::from_utf8_lossy(&iso)
+                        .trim_end_matches(";1")
+                        .to_owned(),
+                );
+                used_jol.push(jol.clone());
                 self.nodes[c].iso_name = iso;
                 self.nodes[c].jol_name = jol;
             }
@@ -193,7 +200,11 @@ impl Tree {
 }
 
 fn add_child(nodes: &mut Vec<Node>, parent: usize, path: &Path, depth: u16) -> Result<()> {
-    let meta = fs::metadata(path).with_context(|| format!("无法读取 {}", path.display()))?;
+    let meta =
+        fs::symlink_metadata(path).with_context(|| format!("无法读取 {}", path.display()))?;
+    if meta.is_symlink() {
+        bail!("请添加符号链接指向的实际文件或目录：{}", path.display());
+    }
     if meta.is_dir() == false && meta.is_file() == false {
         return Ok(()); // 跳过设备文件、套接字等
     }
@@ -233,26 +244,27 @@ fn add_child(nodes: &mut Vec<Node>, parent: usize, path: &Path, depth: u16) -> R
 }
 
 fn make_iso_name(raw: &str, is_dir: bool, used: &[String]) -> Vec<u8> {
-    let mut base: String = raw
-        .chars()
-        .map(|c| {
-            let u = c.to_ascii_uppercase();
-            if u.is_ascii_alphanumeric() || u == '_' {
-                u
-            } else {
-                '_'
-            }
-        })
-        .collect();
-
-    let mut ext = String::new();
-    if is_dir == false {
-        if let Some(pos) = base.rfind('.') {
-            let e: String = base[pos + 1..].to_string();
-            base.truncate(pos);
-            ext = e;
-        }
-    }
+    let (stem, extension) = if !is_dir {
+        raw.rsplit_once('.')
+            .filter(|(stem, _)| !stem.is_empty())
+            .unwrap_or((raw, ""))
+    } else {
+        (raw, "")
+    };
+    let sanitize = |part: &str| -> String {
+        part.chars()
+            .map(|c| {
+                let upper = c.to_ascii_uppercase();
+                if upper.is_ascii_alphanumeric() || upper == '_' {
+                    upper
+                } else {
+                    '_'
+                }
+            })
+            .collect()
+    };
+    let mut base = sanitize(stem);
+    let mut ext = sanitize(extension);
     if base.is_empty() {
         base = "FILE".into();
     }
@@ -289,43 +301,38 @@ fn make_iso_name(raw: &str, is_dir: bool, used: &[String]) -> Vec<u8> {
     }
 }
 
-fn make_joliet_name(raw: &str, used: &[String], is_dir: bool) -> Vec<u8> {
-    let mut name = raw.to_string();
-    // Joliet 标识符最长 64 字节 = 32 个 UCS-2 字符
-    if name.chars().count() > 32 {
-        name = name.chars().take(32).collect();
-    }
-    let mut bytes = name.encode_utf16().flat_map(|u| u.to_be_bytes()).collect::<Vec<u8>>();
+fn make_joliet_name(raw: &str, used: &[Vec<u8>], _is_dir: bool) -> Vec<u8> {
+    let name: Vec<u16> = raw
+        .chars()
+        .map(|c| u16::try_from(c as u32).unwrap_or(b'_' as u16))
+        .take(32)
+        .collect();
 
+    let mut candidate: Vec<u8> = name.iter().flat_map(|u| u.to_be_bytes()).collect();
     let mut n = 1;
-    while used
-        .iter()
-        .any(|u| u.as_bytes() == &bytes[..])
-    {
-        let suffix = format!("~{}", n);
-        let keep = 32usize.saturating_sub(suffix.chars().count());
-        let stem: String = name.chars().take(keep).collect();
-        let candidate = format!("{stem}{suffix}");
-        bytes = candidate
-            .encode_utf16()
-            .flat_map(|u| u.to_be_bytes())
-            .collect::<Vec<u8>>();
+    while used.contains(&candidate) {
+        let suffix = format!("~{n}");
+        candidate = name
+            .iter()
+            .copied()
+            .take(32usize.saturating_sub(suffix.len()))
+            .chain(suffix.encode_utf16())
+            .flat_map(u16::to_be_bytes)
+            .collect();
         n += 1;
     }
-
-    if bytes.len() > 64 {
-        bytes.truncate(64);
-    }
-    // Joliet 里目录名不带上限差异,文件也不需要 ";1"
-    let _ = is_dir;
-    bytes
+    candidate
 }
 
 // ------------------------------------------------------------------ 目录记录
 
 fn record_len(name_len: usize) -> usize {
     let n = 33 + name_len;
-    if n % 2 == 1 { n + 1 } else { n }
+    if n % 2 == 1 {
+        n + 1
+    } else {
+        n
+    }
 }
 
 fn put_dir_record(
@@ -337,7 +344,7 @@ fn put_dir_record(
     dt: &[u8; 7],
 ) {
     let len = record_len(name.len());
-    let start = out.len();
+    let start = dir_record_start(out.len(), len);
     out.resize(start + len, 0);
     let r = &mut out[start..start + len];
 
@@ -355,11 +362,7 @@ fn put_dir_record(
 }
 
 /// 目录块:先 "." 再 ".." 再子项
-fn build_dir_block(
-    tree: &Tree,
-    dir_idx: usize,
-    joliet: bool,
-) -> Vec<u8> {
+fn build_dir_block(tree: &Tree, dir_idx: usize, joliet: bool) -> Vec<u8> {
     let mut out = Vec::new();
     let node = &tree.nodes[dir_idx];
 
@@ -370,16 +373,36 @@ fn build_dir_block(
     };
 
     // "."
-    put_dir_record(&mut out, &[0u8], self_lba, self_size, true, &iso_datetime_7(node.mtime));
+    put_dir_record(
+        &mut out,
+        &[0u8],
+        self_lba,
+        self_size,
+        true,
+        &iso_datetime_7(node.mtime),
+    );
 
     // ".."
     let parent = if dir_idx == 0 { 0 } else { node.parent };
     let (p_lba, p_size) = if joliet {
-        (tree.nodes[parent].jol_dir_lba, dir_block_size(tree, parent, true))
+        (
+            tree.nodes[parent].jol_dir_lba,
+            dir_block_size(tree, parent, true),
+        )
     } else {
-        (tree.nodes[parent].iso_dir_lba, dir_block_size(tree, parent, false))
+        (
+            tree.nodes[parent].iso_dir_lba,
+            dir_block_size(tree, parent, false),
+        )
     };
-    put_dir_record(&mut out, &[1u8], p_lba, p_size, true, &iso_datetime_7(node.mtime));
+    put_dir_record(
+        &mut out,
+        &[1u8],
+        p_lba,
+        p_size,
+        true,
+        &iso_datetime_7(node.mtime),
+    );
 
     for &c in &node.children {
         let ch = &tree.nodes[c];
@@ -393,13 +416,29 @@ fn build_dir_block(
         } else {
             (ch.data_lba, ch.size as u32)
         };
-        put_dir_record(&mut out, name, extent, size, ch.is_dir, &iso_datetime_7(ch.mtime));
+        put_dir_record(
+            &mut out,
+            name,
+            extent,
+            size,
+            ch.is_dir,
+            &iso_datetime_7(ch.mtime),
+        );
     }
 
     // 补齐到整扇区
     let padded = ((out.len() as u32 + SECTOR - 1) / SECTOR) * SECTOR;
     out.resize(padded as usize, 0);
     out
+}
+
+fn dir_record_start(offset: usize, len: usize) -> usize {
+    let sector = SECTOR as usize;
+    if offset % sector + len > sector {
+        offset.next_multiple_of(sector)
+    } else {
+        offset
+    }
 }
 
 fn dir_block_size(tree: &Tree, dir_idx: usize, joliet: bool) -> u32 {
@@ -409,8 +448,13 @@ fn dir_block_size(tree: &Tree, dir_idx: usize, joliet: bool) -> u32 {
     len += record_len(1); // ".."
     for &c in &node.children {
         let ch = &tree.nodes[c];
-        let nl = if joliet { ch.jol_name.len() } else { ch.iso_name.len() };
-        len += record_len(nl);
+        let nl = if joliet {
+            ch.jol_name.len()
+        } else {
+            ch.iso_name.len()
+        };
+        let record = record_len(nl);
+        len = dir_record_start(len, record) + record;
     }
     let padded = ((len as u32 + SECTOR - 1) / SECTOR) * SECTOR;
     padded
@@ -440,10 +484,15 @@ fn build_path_table(tree: &Tree, joliet: bool, big_endian: bool) -> Vec<u8> {
         } else {
             node.iso_name.clone()
         };
-        let extent = if joliet { node.jol_dir_lba } else { node.iso_dir_lba };
+        let extent = if joliet {
+            node.jol_dir_lba
+        } else {
+            node.iso_dir_lba
+        };
         let parent = if i == 0 { 0 } else { index_of[node.parent] };
 
-        out.push((1 + name.len()) as u8);
+        let name_len = name.len().max(1);
+        out.push(name_len as u8);
         out.push(0);
         if big_endian {
             out.extend_from_slice(&extent.to_be_bytes());
@@ -452,8 +501,12 @@ fn build_path_table(tree: &Tree, joliet: bool, big_endian: bool) -> Vec<u8> {
             out.extend_from_slice(&extent.to_le_bytes());
             out.extend_from_slice(&parent.to_le_bytes());
         }
-        out.extend_from_slice(&name);
-        if (1 + name.len()) % 2 == 1 {
+        if name.is_empty() {
+            out.push(0);
+        } else {
+            out.extend_from_slice(&name);
+        }
+        if name_len % 2 == 1 {
             out.push(0);
         }
     }
@@ -513,8 +566,16 @@ fn layout(tree: &mut Tree) -> Result<(u32, u32, u32, u32, u32)> {
     for i in 0..n {
         if tree.nodes[i].is_dir == false {
             tree.nodes[i].data_lba = cursor;
-            let sectors = ((tree.nodes[i].size as u32 + SECTOR - 1) / SECTOR).max(1);
-            cursor += sectors;
+            let size = u32::try_from(tree.nodes[i].size).with_context(|| {
+                format!(
+                    "单个文件超过 ISO 9660 大小上限：{}",
+                    tree.nodes[i].src.display()
+                )
+            })?;
+            let sectors = size.div_ceil(SECTOR).max(1);
+            cursor = cursor
+                .checked_add(sectors)
+                .context("ISO 总容量超过寻址上限")?;
         }
     }
 
@@ -531,12 +592,21 @@ pub fn build_iso(
     srcs: &[PathBuf],
     label: &str,
     out: &Path,
+    max_bytes: u64,
     progress: &mut dyn FnMut(u64, u64),
 ) -> Result<IsoSummary> {
     let mut tree = Tree::collect(srcs)?;
     tree.assign_names()?;
 
     let (pvd_l, pvd_m, jol_l, jol_m, total_sectors) = layout(&mut tree)?;
+    let bytes = u64::from(total_sectors) * u64::from(SECTOR);
+    if bytes > max_bytes {
+        bail!(
+            "ISO 需要 {}，设备容量为 {}",
+            crate::device::human_size(bytes),
+            crate::device::human_size(max_bytes)
+        );
+    }
 
     let total_bytes: u64 = tree
         .nodes
@@ -617,29 +687,33 @@ pub fn build_iso(
 
     // 文件数据
     let mut written: u64 = 0;
+    let mut buffer = vec![0; 1024 * 1024];
     for i in 0..tree.nodes.len() {
         if tree.nodes[i].is_dir {
             continue;
         }
         let node = &tree.nodes[i];
-        let mut rf = File::open(&node.src)
-            .with_context(|| format!("无法打开 {}", node.src.display()))?;
-        let copied = std::io::copy(&mut rf, &mut f)?;
-        if copied != node.size {
-            bail!(
-                "{} 大小在生成过程中变化({} != {})",
-                node.src.display(),
-                copied,
-                node.size
-            );
+        let mut rf =
+            File::open(&node.src).with_context(|| format!("无法打开 {}", node.src.display()))?;
+        let mut remaining = node.size;
+        while remaining > 0 {
+            let count = remaining.min(buffer.len() as u64) as usize;
+            rf.read_exact(&mut buffer[..count])
+                .with_context(|| format!("读取 {} 失败", node.src.display()))?;
+            f.write_all(&buffer[..count])?;
+            remaining -= count as u64;
+            written += count as u64;
+            progress(written, total_bytes);
+        }
+        if rf.read(&mut buffer[..1])? != 0 {
+            bail!("{} 在生成过程中变大", node.src.display());
         }
         // 补齐扇区
-        let pad = (SECTOR as u64 - (node.size % SECTOR as u64)) % SECTOR as u64;
+        let sector = u64::from(SECTOR);
+        let pad = node.size.next_multiple_of(sector).max(sector) - node.size;
         if pad > 0 {
             f.write_all(&vec![0u8; pad as usize])?;
         }
-        written += copied;
-        progress(written, total_bytes);
     }
 
     // 若没有文件,也补到声明的大小
@@ -662,7 +736,7 @@ pub fn build_iso(
 
     Ok(IsoSummary {
         sectors: total_sectors,
-        bytes: total_sectors as u64 * SECTOR as u64,
+        bytes,
         files,
         dirs,
     })
@@ -690,6 +764,9 @@ fn make_vol_id_ascii(label: &str) -> [u8; 32] {
 
 fn make_vol_id_joliet(label: &str) -> [u8; 32] {
     let mut out = [0u8; 32];
+    for pair in out.chunks_exact_mut(2) {
+        pair[1] = b' ';
+    }
     let s: String = label.chars().take(16).collect();
     let bytes: Vec<u8> = s.encode_utf16().flat_map(|u| u.to_be_bytes()).collect();
     for (i, b) in bytes.into_iter().take(32).enumerate() {
@@ -710,7 +787,19 @@ fn write_pvd(
     escape: &[u8],
 ) {
     let is_joliet = ty == 2;
-    let pt = build_path_table(tree, is_joliet, false);
+    let pt_size: usize = tree
+        .nodes
+        .iter()
+        .filter(|n| n.is_dir)
+        .map(|n| {
+            let length = if is_joliet {
+                n.jol_name.len()
+            } else {
+                n.iso_name.len()
+            };
+            8 + length.max(1).next_multiple_of(2)
+        })
+        .sum();
 
     buf[0] = ty;
     buf[1..6].copy_from_slice(b"CD001");
@@ -730,7 +819,7 @@ fn write_pvd(
     // 逻辑块大小 128..132
     buf[128..132].copy_from_slice(&both16(SECTOR as u16));
     // 路径表大小 132..140
-    buf[132..140].copy_from_slice(&both32(pt.len() as u32));
+    buf[132..140].copy_from_slice(&both32(pt_size as u32));
     // L 路径表 140..144
     buf[140..144].copy_from_slice(&l_pt.to_le_bytes());
     // 可选 L 147.. 空

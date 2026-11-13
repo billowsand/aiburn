@@ -1689,6 +1689,7 @@ dependencies = [
  "libc",
  "rfd",
  "sha2",
+ "tempfile",
 ]
 
 [[package]]
