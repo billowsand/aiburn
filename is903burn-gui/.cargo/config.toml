@@ -1,0 +1,5 @@
+# Windows: 静态链接 MSVC CRT，生成的 exe 不依赖 vcruntime140.dll /
+# api-ms-win-crt-*.dll，可以在没装 VC++ 运行库的机器上直接运行（便携版）。
+# Linux / macOS 不受影响。
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

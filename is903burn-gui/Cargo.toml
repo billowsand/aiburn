@@ -6,7 +6,19 @@ rust-version = "1.95"
 description = "IS903 (UFCD) 烧录工具 — 图形界面"
 
 [dependencies]
-eframe = "0.37"
+# 只用 glow(OpenGL) 后端。eframe 的默认特性里包含 wgpu + DX12/着色器编译器，
+# 光这一项就要多出约 2 MB，而本工具的界面用不到。
+# 若目标机器没有 OpenGL 3.3（部分虚拟机、远程桌面），把下面的 "glow" 换成
+# "wgpu_no_default_features"，并在 [target.'cfg(target_os = "windows")']
+# 里启用 wgpu 的 "dx12" 特性即可切回 DX12 后端。
+eframe = { version = "0.37", default-features = false, features = [
+    "clipboard",
+    "default_fonts",
+    "glow",
+    "links",
+    "wayland",
+    "x11",
+] }
 rfd = "0.15"
 sha2 = "0.10"
 libc = "0.2"
@@ -14,8 +26,26 @@ anyhow = "1"
 tempfile = "3"
 
 [profile.release]
-opt-level = 2
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
 strip = true
 
 [build-dependencies]
 cc = "1"
+
+# 备选：切到 DX12 后端时取消下面的注释（同时把上面的 "glow" 换成
+# "wgpu_no_default_features"）。
+# [target.'cfg(target_os = "windows")'.dependencies]
+# wgpu = { version = "30", default-features = false, features = ["dx12"] }
+
+# eframe 关掉默认特性后 winit 只剩 rwh_06，Linux 上会缺少 Wayland 的
+# libwayland 动态加载和 CSD 装饰，这里按目标平台补回来。
+[target.'cfg(target_os = "linux")'.dependencies]
+winit = { version = "0.30", default-features = false, features = [
+    "rwh_06",
+    "wayland-csd-adwaita",
+    "wayland-dlopen",
+    "x11",
+] }

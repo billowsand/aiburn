@@ -1,4 +1,7 @@
 //! IS903 烧录工具 —— 图形界面
+//!
+//! 发布版不弹控制台窗口；带 CLI 参数时会挂回父进程的控制台。
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
 mod burn;
@@ -7,7 +10,6 @@ mod iso;
 mod job;
 mod mount;
 mod sg;
-mod theme;
 #[cfg(target_os = "windows")]
 mod winapi;
 
@@ -41,6 +43,8 @@ fn main() -> eframe::Result<()> {
         if only_paths {
             initial = a[1..].iter().map(std::path::PathBuf::from).collect();
         } else {
+            #[cfg(target_os = "windows")]
+            winapi::attach_parent_console();
             let code = match cli(&a) {
                 Ok(c) => c,
                 Err(e) => {

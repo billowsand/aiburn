@@ -150,6 +150,27 @@ powershell -ExecutionPolicy Bypass -File .\is903burn-gui\build-windows.ps1
 .\is903burn-gui\target\release\is903burn-gui.exe --burn D: -l LABEL .\data
 ```
 
+便携版（单个 exe + 使用说明，打包成 zip）：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\is903burn-gui\build-windows.ps1 -Portable
+# 产物：is903burn-gui\dist\is903burn-gui-windows-x64.zip（解压后直接双击 exe）
+```
+
+体积与依赖（实测）：
+
+* exe 约 **4.7 MB**，zip 约 **2.3 MB**。
+* 静态链接 MSVC 运行库（`is903burn-gui/.cargo/config.toml` 里的
+  `+crt-static`），因此没有 `vcruntime140.dll` / `api-ms-win-crt-*.dll` 依赖，
+  只调用系统自带的 DLL，目标机器不需要装 VC++ 运行库。
+* 渲染用 glow（OpenGL），没启用 eframe 默认的 wgpu + DX12 后端，
+  发布配置开了 `lto`/`codegen-units=1`/`panic=abort`/`opt-level=s`。
+  如果目标机器没有 OpenGL 3.3（部分虚拟机、远程桌面），按 `Cargo.toml`
+  里的注释切到 `wgpu_no_default_features` + `wgpu/dx12` 重新编译即可
+  （体积会多约 2 MB）。
+* 发布版是 GUI 子系统程序，双击不会弹控制台；带 CLI 参数运行时会自动
+  挂回父进程的控制台，`--devices` 等输出仍然可见。
+
 ## 6. 故障排查：程序显示「容量为 0」
 
 如果 `--devices` 或界面里容量是 `0 B`，而设备明明插着，先看是不是

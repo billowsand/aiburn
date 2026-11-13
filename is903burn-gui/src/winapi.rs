@@ -431,3 +431,17 @@ pub fn lock_path(serial: &str, fallback: &str) -> std::path::PathBuf {
     .collect();
     std::env::temp_dir().join(format!("is903burn-{name}.lock"))
 }
+
+/// 便携版是 GUI 子系统程序，直接运行没有控制台。CLI 模式下挂到父进程的
+/// 控制台，`println!` 才有地方输出（Rust 的 stdout 句柄是首次使用时取的，
+/// 所以必须在任何输出之前调用）。
+pub fn attach_parent_console() {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn AttachConsole(process_id: u32) -> i32;
+    }
+    const ATTACH_PARENT_PROCESS: u32 = -1i32 as u32;
+    unsafe {
+        AttachConsole(ATTACH_PARENT_PROCESS);
+    }
+}

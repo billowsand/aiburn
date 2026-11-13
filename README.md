@@ -28,7 +28,7 @@ Innostar IS903 "USB Flash CD-ROM" (UFCD) chip using vendor SCSI commands.
 
 ### 图形界面
 
-界面按「小工具」设计：顶部是设备状态，中间是烧录内容，底部是卷标和主按钮。
+界面用 egui 默认样式，没有自绘皮肤和配色：顶部是设备，中间是烧录内容，底部是卷标和主按钮。
 
 ![图形界面](is903burn-gui/screenshots/main.png)
 
@@ -37,10 +37,11 @@ Innostar IS903 "USB Flash CD-ROM" (UFCD) chip using vendor SCSI commands.
 - 快捷键：`Enter` 打开确认框，`F5` 重新扫描设备。烧录中可按「取消」中止，但写入已开始时
   光盘内容可能不完整。
 - 卷标默认取第一个来源的名字（最多 16 个字符），手动改过后不再自动更新。
-- 设备未就绪（例如光驱里没有光盘）时按钮为灰色，并在设备卡片里说明原因。
+- 设备未就绪（例如光驱里没有光盘）时按钮为灰色，并在设备区域里说明原因。
 - 也可以把文件/文件夹拖到 `is903burn-gui.exe` 图标上，界面会带着这些来源启动。
-
-更多状态截图：[烧录中](is903burn-gui/screenshots/burning.png)、[确认对话框](is903burn-gui/screenshots/confirm.png)。
+- Windows 便携版就是一个 `is903burn-gui.exe`（约 4.7 MB）：静态链接 MSVC 运行库，
+  不需要安装 VC++ 运行库、也不依赖其它 DLL，可以拷到 U 盘直接用。
+  `build-windows.ps1 -Portable` 会连同使用说明打成 zip。
 
 **文件名长度**：ISO 里同时写 ISO 9660 主树（8.3 短名，仅作老设备的兼容回退）和 Joliet 树
 （原名、中文）。Joliet 单个名字最长 **64 个字符**，这是 Windows、Linux、macOS 通行的上限，
