@@ -5,34 +5,30 @@ Innostar IS903 "USB Flash CD-ROM" (UFCD) chip using vendor SCSI commands.
 `is903burn` is a native Linux reimplementation of that protocol, speaking
 `SG_IO` directly to `/dev/sg0`.
 
-**图形界面(推荐)**
+## 桌面程序（Linux 和 macOS）
 
-`is903burn-gui/` 是支持 IS903 光驱和大容量存储模式的 Rust + egui 桌面程序。
+`is903burn-gui` 在两个平台使用相同的 GUI、CLI 和 ISO 生成器，支持 ISO 9660 + Joliet 和中文文件名。以下命令从仓库根目录运行。构建需要 Rust 1.95 或更新版本。
+
+| 平台 | 构建命令 | 构建依赖 |
+| --- | --- | --- |
+| Linux | `./is903burn-gui/build-linux.sh` | C 工具链和 pkg-config。例如 Debian/Ubuntu 的 `build-essential`、`pkg-config` |
+| macOS | `./is903burn-gui/build-macos.sh` | Xcode Command Line Tools、libusb 1.0.30 或更新版本（`brew install libusb`） |
+
+两个脚本在各自的系统上构建 Release 版，默认输出到 `is903burn-gui/target/release/is903burn-gui`。macOS 构建使用 Homebrew 的 libusb，也可通过 `IS903_LIBUSB_PREFIX` 指定安装路径。运行时需要保留对应的 libusb 动态库。
 
 ```sh
-cd is903burn-gui
-cargo build --release
-./target/release/is903burn-gui
+./is903burn-gui/target/release/is903burn-gui            # 启动 GUI
+./is903burn-gui/target/release/is903burn-gui --devices  # 列出设备
 ```
 
-选择设备，添加或拖入文件和文件夹，设置卷标后即可烧录。程序生成 ISO 并检查
-容量，卸载设备后在后台写入。光驱模式使用已在真机验证的 `P.M.` 命令，
-随后重新绑定同一 USB 存储接口，再用 `READ(10)` 回读整盘。大容量存储
-模式使用块写入与 `O_DIRECT` 回读。整盘验证、自动挂载和文件哈希核对
-都通过后，界面才显示烧录完成。
+- **Linux**：光驱烧录使用 `SG_IO`。需要加载 `sg` 模块并具备目标 `/dev/sgN` 的读写权限。挂载与卸载依赖 `udisksctl`（`udisks2`），刷新光驱时系统可能通过 `pkexec` 请求授权。
+- **macOS**：光驱烧录使用 libusb 接管 USB 接口。通过终端以管理员权限执行 `--burn`。挂载与卸载使用系统自带的 `diskutil`。[macOS 用法与实测记录](macOS.md)
 
-光驱模式需要加载 `sg`，并有目标 `/dev/sgN` 的读写权限。挂载和卸载
-使用 `udisksctl`，重新绑定 USB 存储接口时系统可能通过 `pkexec` 请求授权。
-
-ISO 由程序内部纯 Rust 生成(ISO 9660 + Joliet,支持中文文件名),不依赖
-`xorrisofs` 等外部工具。
-
-命令行自检:
+下面的 CLI 用法适用于两平台。macOS 光驱烧录时在烧录命令前加 `sudo`。目标设备节点以 `--devices` 的输出为准。
 
 ```sh
-./target/release/is903burn-gui --devices                    # 列出设备
-./target/release/is903burn-gui --mkiso <来源…> -l L -o F    # 只生成 ISO
-./target/release/is903burn-gui --burn <块设备> -l L <来源…> # 无界面烧录
+./is903burn-gui/target/release/is903burn-gui --mkiso ./data -l MYDATA -o /tmp/data.iso
+./is903burn-gui/target/release/is903burn-gui --burn /dev/设备节点 -l MYDATA ./data
 ```
 
 **Documentation**
@@ -43,7 +39,7 @@ ISO 由程序内部纯 Rust 生成(ISO 9660 + Joliet,支持中文文件名),不�
 * [PROTOCOL.md](PROTOCOL.md) — the reverse engineered vendor SCSI protocol.
 * [README.md](README.md) — this file: build and command reference.
 
-## Build
+## Build the Linux C utility
 
 ```sh
 make

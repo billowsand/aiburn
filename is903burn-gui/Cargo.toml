@@ -2,6 +2,7 @@
 name = "is903burn-gui"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.95"
 description = "IS903 (UFCD) 烧录工具 — 图形界面"
 
 [dependencies]
@@ -15,3 +16,6 @@ tempfile = "3"
 [profile.release]
 opt-level = 2
 strip = true
+
+[build-dependencies]
+cc = "1"

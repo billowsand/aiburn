@@ -99,6 +99,17 @@ fn cli(a: &[String]) -> anyhow::Result<i32> {
             );
             Ok(0)
         }
+        #[cfg(target_os = "macos")]
+        "--verify-cd" => {
+            anyhow::ensure!(a.len() == 4, "用法: --verify-cd <整盘节点> <ISO>");
+            let node = std::fs::canonicalize(&a[2])?;
+            let target = device::scan()
+                .into_iter()
+                .find(|d| d.node == node)
+                .ok_or_else(|| anyhow::anyhow!("{} 不是已识别的 IS903 设备", node.display()))?;
+            job::verify_cd(&target, std::path::Path::new(&a[3]))?;
+            Ok(0)
+        }
         "--burn" => {
             // --burn <块设备> -l <卷标> <来源…>
             let mut blk = String::new();

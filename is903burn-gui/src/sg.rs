@@ -1,8 +1,11 @@
 //! IS903 厂商写入与光盘视图回读，协议见 PROTOCOL.md。
 
 use anyhow::{bail, ensure, Context, Result};
-use std::fs::{File, OpenOptions};
+use std::fs::File;
+#[cfg(target_os = "linux")]
+use std::fs::OpenOptions;
 use std::io::Read;
+#[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
 use std::path::Path;
 
@@ -11,9 +14,13 @@ const VENDOR_BLOCK: usize = 512;
 const CHUNK: usize = 64 * 1024;
 
 pub struct Sg {
+    #[cfg(target_os = "linux")]
     file: File,
+    #[cfg(target_os = "macos")]
+    usb: Option<std::ptr::NonNull<libc::c_void>>,
 }
 
+#[cfg(target_os = "linux")]
 #[repr(C)]
 #[derive(Default)]
 struct SgIoHdr {
@@ -41,11 +48,13 @@ struct SgIoHdr {
     info: u32,
 }
 
+#[cfg(target_os = "linux")]
 const SG_IO: libc::c_ulong = 0x2285;
 const SG_DXFER_TO_DEV: libc::c_int = -2;
 const SG_DXFER_FROM_DEV: libc::c_int = -3;
 
 impl Sg {
+    #[cfg(target_os = "linux")]
     pub fn open(path: &Path, write: bool) -> Result<Self> {
         let file = OpenOptions::new()
             .read(true)
@@ -55,6 +64,7 @@ impl Sg {
         Ok(Self { file })
     }
 
+    #[cfg(target_os = "linux")]
     fn cmd(&self, cdb: &mut [u8], dir: i32, buf: &mut [u8], timeout_ms: u32) -> Result<()> {
         let mut sense = [0u8; 32];
         let mut h = SgIoHdr {
@@ -88,6 +98,64 @@ impl Sg {
                 &sense[..usize::from(h.sb_len_wr).min(sense.len())]
             );
         }
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn capture(device: &crate::device::Device) -> Result<Self> {
+        let session = device.usb_session()?;
+        let mut handle = std::ptr::null_mut();
+        let status = unsafe { is903_usb_open(session, &mut handle) };
+        ensure!(status == 0, "无法接管 IS903 USB 接口（libusb {status}）");
+        let drive = Self {
+            usb: std::ptr::NonNull::new(handle),
+        };
+        ensure!(drive.usb.is_some(), "USB 接口为空");
+        let mut inquiry = [0; 36];
+        drive.cmd(
+            &mut [0x12, 0, 0, 0, 36, 0],
+            SG_DXFER_FROM_DEV,
+            &mut inquiry,
+            5000,
+        )?;
+        ensure!(inquiry[0] & 0x1f == 5, "目标 USB 设备不在 CD-ROM 模式");
+        Ok(drive)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn release(mut self) -> Result<()> {
+        let status = self.close();
+        ensure!(status == 0, "释放 IS903 USB 接口失败（libusb {status}）");
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn close(&mut self) -> i32 {
+        self.usb
+            .take()
+            .map_or(0, |handle| unsafe { is903_usb_close(handle.as_ptr()) })
+    }
+
+    #[cfg(target_os = "macos")]
+    fn cmd(&self, cdb: &mut [u8], dir: i32, buf: &mut [u8], timeout_ms: u32) -> Result<()> {
+        let handle = self.usb.context("USB 接口已关闭")?;
+        let size = i32::try_from(buf.len())?;
+        let transferred = unsafe {
+            is903_usb_cmd(
+                handle.as_ptr(),
+                cdb.as_ptr(),
+                cdb.len() as u8,
+                buf.as_mut_ptr(),
+                size,
+                i32::from(dir == SG_DXFER_FROM_DEV),
+                timeout_ms,
+            )
+        };
+        ensure!(
+            transferred == size,
+            "USB SCSI 命令 {:#04x} 失败（传输 {transferred} / {size} 字节）",
+            cdb[0]
+        );
         Ok(())
     }
 
@@ -253,4 +321,26 @@ fn key_response(challenge: u16) -> [u8; 12] {
         *byte ^= mask;
     }
     response
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for Sg {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+#[cfg(target_os = "macos")]
+extern "C" {
+    fn is903_usb_open(session: libc::c_ulong, output: *mut *mut libc::c_void) -> i32;
+    fn is903_usb_close(handle: *mut libc::c_void) -> i32;
+    fn is903_usb_cmd(
+        handle: *mut libc::c_void,
+        cdb: *const u8,
+        cdb_size: u8,
+        data: *mut u8,
+        size: i32,
+        data_in: i32,
+        timeout: u32,
+    ) -> i32;
 }

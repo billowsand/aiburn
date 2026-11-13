@@ -116,11 +116,13 @@ pub fn run(
     let dev = dev.current()?;
 
     stage("写入设备", 0.30);
-    let mut disc = if dev.is_writable() {
+    let writable = dev.is_writable();
+    let mut disc = if writable {
         burn::write_iso(&dev.node, image, progress("写入设备", 0.30, 0.70))
             .context("写入块设备失败")?;
         dev
     } else {
+        #[cfg(target_os = "linux")]
         {
             let sg_node = dev
                 .sg_node
@@ -135,13 +137,43 @@ pub fn run(
                 .write_iso(image, progress("写入光驱", 0.30, 0.70))
                 .context("写入光驱失败")?;
         }
+        #[cfg(target_os = "macos")]
+        {
+            let drive = sg::Sg::capture(&dev)?;
+            drive
+                .write_iso(image, progress("写入光驱", 0.30, 0.70))
+                .context("写入光驱失败，旧镜像可能已被部分覆盖")?;
+            drive.release().context("镜像已发送，释放 USB 接口失败")?;
+        }
         stage("刷新光驱 · 系统可能要求授权", 0.72);
         device::reenumerate(&dev, Duration::from_secs(15)).context("镜像已发送，刷新光驱失败")?
     };
     log("设备写入完成");
 
+    // macOS:写完之后设备可能立刻切回只读的 CD-ROM 模式,磁盘节点随之消失。
+    // 这时无法继续回读与挂载,直接报告写入成功。
+    #[cfg(target_os = "macos")]
+    if writable {
+        std::thread::sleep(Duration::from_secs(2));
+        let again = device::scan();
+        let still_there = again
+            .iter()
+            .any(|d| d.same_connection(&disc) && d.is_writable());
+        if !still_there {
+            log("写入完成:设备已切换为只读 CD-ROM 模式,请拔插后重新插入查看内容");
+            return Ok(JobOk {
+                mount_point: PathBuf::new(),
+                iso_bytes: summary.bytes,
+                iso_sectors: summary.sectors,
+                files: summary.files,
+                dirs: summary.dirs.saturating_sub(1),
+                secs: started.elapsed().as_secs_f64(),
+            });
+        }
+    }
+
     stage("回读整盘", 0.76);
-    verify(&disc, image, progress("回读整盘", 0.76, 0.91))?;
+    disc = verify(&disc, image, progress("回读整盘", 0.76, 0.91))?;
     log("整盘回读与 ISO 一致");
 
     stage("挂载并核对文件", 0.93);
@@ -155,7 +187,7 @@ pub fn run(
             stage("刷新设备 · 系统可能要求授权", 0.93);
             disc = device::reenumerate(&disc, Duration::from_secs(15))?;
             stage("重新核验镜像", 0.94);
-            verify(&disc, image, progress("重新核验镜像", 0.94, 0.97))?;
+            disc = verify(&disc, image, progress("重新核验镜像", 0.94, 0.97))?;
             stage("挂载并核对文件", 0.98);
             mount_and_check(&disc, &expected)?
         }
@@ -186,7 +218,25 @@ fn lock_target(dev: &device::Device) -> Result<std::fs::File> {
     Ok(lock)
 }
 
-fn verify(dev: &device::Device, image: &Path, progress: impl FnMut(u64, u64)) -> Result<()> {
+#[cfg(target_os = "macos")]
+pub fn verify_cd(target: &device::Device, image: &Path) -> Result<()> {
+    let dev = target.current()?;
+    ensure!(!dev.is_writable(), "请选择 IS903 CD-ROM 设备");
+    dev.check_access()?;
+    ensure!(image.is_file(), "找不到要校验的 ISO");
+    let _lock = lock_target(&dev)?;
+    let disc = verify(&dev, image, |_, _| {})?;
+    let track = device::cd_data_track(&disc)?;
+    let path = mount::mount(&track).context("ISO 已逐字节校验，重新挂载失败")?;
+    println!("ISO 回读一致，已挂载于 {}", path.display());
+    Ok(())
+}
+
+fn verify(
+    dev: &device::Device,
+    image: &Path,
+    progress: impl FnMut(u64, u64),
+) -> Result<device::Device> {
     dev.current()?;
     if dev.is_writable() {
         ensure!(
@@ -194,14 +244,32 @@ fn verify(dev: &device::Device, image: &Path, progress: impl FnMut(u64, u64)) ->
             "整盘回读与 ISO 不一致"
         );
     } else {
+        #[cfg(target_os = "linux")]
         sg::Sg::open(&dev.node, false)?.verify_iso(image, progress)?;
+        #[cfg(target_os = "macos")]
+        {
+            mount::unmount(&dev.node)?;
+            let current = dev.current()?;
+            let drive = sg::Sg::capture(&current)?;
+            drive.verify_iso(image, progress)?;
+            drive.release()?;
+            return device::reenumerate(&current, Duration::from_secs(15))
+                .context("ISO 已逐字节校验，释放 USB 后未找到光驱");
+        }
     }
-    Ok(())
+    Ok(dev.clone())
 }
 
 fn mount_and_check(dev: &device::Device, expected: &[(u64, String)]) -> Result<PathBuf> {
     dev.current()?;
-    let path = mount::mount(&dev.node).context("整盘已核验，挂载失败")?;
+    let node = dev.node.clone();
+    #[cfg(target_os = "macos")]
+    let node = if dev.is_writable() {
+        node
+    } else {
+        device::cd_data_track(dev)?
+    };
+    let path = mount::mount(&node).context("整盘已核验，挂载失败")?;
     let actual = burn::hash_tree(std::slice::from_ref(&path)).context("读取挂载后的文件失败")?;
     ensure!(
         expected == actual,

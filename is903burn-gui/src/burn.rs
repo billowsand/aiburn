@@ -10,12 +10,17 @@ use std::ffi::CString;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
+#[cfg(target_os = "linux")]
 use std::os::unix::io::AsRawFd;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub const CHUNK: usize = 4 * 1024 * 1024;
 
 /// 丢弃内核为该块设备缓存的页,避免挂载后看到旧内容
+///
+/// Linux 用 `posix_fadvise(POSIX_FADV_DONTNEED)`;macOS 没有 fadvise,
+/// 但回读时用 `F_NOCACHE` 打开即可绕过缓存,这里退化为空操作。
+#[cfg(target_os = "linux")]
 pub fn drop_cache(path: &Path) -> Result<()> {
     let f = File::open(path).with_context(|| format!("打开 {} 失败", path.display()))?;
     let rc = unsafe { libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
@@ -28,16 +33,41 @@ pub fn drop_cache(path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(target_os = "linux"))]
+pub fn drop_cache(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+/// 原始设备节点:macOS 上 /dev/diskN 的原始设备是 /dev/rdiskN,
+/// 走原始设备可以绕开块层缓存,写入与回读都更可靠。
+#[cfg(target_os = "macos")]
+fn raw_node(blk: &Path) -> PathBuf {
+    let name = blk.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+    if let Some(num) = name.strip_prefix("disk") {
+        let raw = PathBuf::from("/dev").join(format!("rdisk{num}"));
+        if raw.exists() {
+            return raw;
+        }
+    }
+    blk.to_path_buf()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn raw_node(blk: &Path) -> PathBuf {
+    blk.to_path_buf()
+}
+
 /// 把 ISO 顺序写入块设备
 pub fn write_iso(blk: &Path, iso: &Path, mut progress: impl FnMut(u64, u64)) -> Result<()> {
     let mut src = File::open(iso).with_context(|| format!("打开 {} 失败", iso.display()))?;
     let total = src.metadata()?.len();
 
+    let target = raw_node(blk);
     let mut dst = OpenOptions::new()
         .write(true)
-        .custom_flags(libc::O_EXCL)
-        .open(blk)
-        .with_context(|| format!("打开 {} 失败(需要 disk 组权限)", blk.display()))?;
+        .custom_flags(exclusive_flag())
+        .open(&target)
+        .with_context(|| format!("打开 {} 失败(需要 disk 组权限)", target.display()))?;
 
     let mut buf = vec![0u8; CHUNK];
     let mut done: u64 = 0;
@@ -63,15 +93,47 @@ pub fn write_iso(blk: &Path, iso: &Path, mut progress: impl FnMut(u64, u64)) -> 
     Ok(())
 }
 
+/// 独占打开标志:只有 Linux 需要 O_EXCL
+#[cfg(target_os = "linux")]
+#[inline]
+fn exclusive_flag() -> libc::c_int {
+    libc::O_EXCL
+}
+
+#[cfg(not(target_os = "linux"))]
+#[inline]
+fn exclusive_flag() -> libc::c_int {
+    0
+}
+
+/// 直读标志:Linux 用 O_DIRECT,macOS 没有 O_DIRECT,改用 F_NOCACHE
+#[cfg(target_os = "linux")]
+#[inline]
+fn direct_flag() -> libc::c_int {
+    libc::O_DIRECT
+}
+
+#[cfg(not(target_os = "linux"))]
+#[inline]
+fn direct_flag() -> libc::c_int {
+    0
+}
+
 /// 用 O_DIRECT 读回设备前 `len` 字节并计算 SHA-256
 fn sha256_odirect(blk: &Path, len: u64, mut progress: impl FnMut(u64, u64)) -> Result<Vec<u8>> {
+    let blk = &raw_node(blk);
     let cpath = CString::new(blk.as_os_str().to_string_lossy().as_bytes())
         .map_err(|_| anyhow::anyhow!("非法路径"))?;
 
-    let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDONLY | libc::O_DIRECT) };
+    let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDONLY | direct_flag()) };
     if fd < 0 {
         return Err(std::io::Error::last_os_error())
-            .with_context(|| format!("O_DIRECT 打开 {} 失败", blk.display()));
+            .with_context(|| format!("直读打开 {} 失败", blk.display()));
+    }
+    // macOS 用 F_NOCACHE 让这个 fd 绕过统一缓冲区缓存
+    #[cfg(not(target_os = "linux"))]
+    unsafe {
+        libc::fcntl(fd, libc::F_NOCACHE, 1);
     }
 
     // 对齐缓冲区(4096 对齐,O_DIRECT 要求)
