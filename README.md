@@ -17,6 +17,10 @@ Innostar IS903 "USB Flash CD-ROM" (UFCD) chip using vendor SCSI commands.
 
 这些脚本在各自的系统上构建 Release 版，默认输出到 `is903burn-gui/target/release/`。macOS 构建使用 Homebrew 的 libusb，也可通过 `IS903_LIBUSB_PREFIX` 指定安装路径。运行时需要保留对应的 libusb 动态库。
 
+- **Windows** 构建会把多尺寸图标内嵌到 `is903burn-gui.exe`，使用 MSVC 工具链随附的 Windows SDK 资源编译器。
+- **macOS** 构建同时生成 `is903burn-gui/target/release/IS903 Burner.app`。从 Finder 打开应用包，或运行 `open 'is903burn-gui/target/release/IS903 Burner.app'`，即可在 Finder 和 Dock 中使用新图标。原始可执行文件继续用于命令行。
+- **Linux** 启动器从 `hicolor` 主题加载图标。Arch Linux 可运行 `./is903burn-gui/build-pacman.sh` 打包，再用 `pacman -U` 安装生成的包。手动安装时，将程序、`.desktop` 文件和 `is903burn-gui/assets/is903burn-gui.png` 分别安装到 `/usr/bin`、`/usr/share/applications` 和 `/usr/share/icons/hicolor/512x512/apps`。
+
 ```sh
 ./is903burn-gui/target/release/is903burn-gui            # 启动 GUI
 ./is903burn-gui/target/release/is903burn-gui --devices  # 列出设备
@@ -28,7 +32,7 @@ Innostar IS903 "USB Flash CD-ROM" (UFCD) chip using vendor SCSI commands.
 
 ### 图形界面
 
-界面固定浅色配色（白底 + 棕色强调，不跟随系统深色）：顶部是设备，中间是烧录内容，底部是卷标和主按钮。
+界面优先跟随 Omarchy 主题配色（读取 `~/.local/state/omarchy/current/theme/colors.toml`），其他系统使用浅色默认配色：顶部是设备，中间是烧录内容，底部是卷标和主按钮。
 
 ![图形界面](is903burn-gui/screenshots/main.png)
 

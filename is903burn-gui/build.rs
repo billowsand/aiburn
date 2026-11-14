@@ -1,9 +1,25 @@
 use std::{env, path::PathBuf, process::Command};
 
 fn main() {
-    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
-        return;
+    println!("cargo:rerun-if-changed=build.rs");
+    match env::var("CARGO_CFG_TARGET_OS").as_deref() {
+        Ok("windows") => {
+            println!("cargo:rerun-if-changed=assets/is903burn-gui.rc");
+            println!("cargo:rerun-if-changed=assets/is903burn-gui.ico");
+            embed_resource::compile_for(
+                "assets/is903burn-gui.rc",
+                ["is903burn-gui"],
+                embed_resource::ParamsMacrosAndIncludeDirs(embed_resource::NONE, ["assets"]),
+            )
+            .manifest_required()
+            .expect("failed to embed Windows application icon");
+        }
+        Ok("macos") => link_macos_usb(),
+        _ => {}
     }
+}
+
+fn link_macos_usb() {
     println!("cargo:rerun-if-changed=../tools/is903-macos-probe.c");
     println!("cargo:rerun-if-env-changed=IS903_LIBUSB_PREFIX");
     let prefix = env::var_os("IS903_LIBUSB_PREFIX")

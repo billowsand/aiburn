@@ -24,6 +24,9 @@ if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
 
 Set-Location -LiteralPath $PSScriptRoot
 cargo build --release --locked @args
+if ($LASTEXITCODE -ne 0) {
+    exit $LASTEXITCODE
+}
 
 $exe = Join-Path $PSScriptRoot 'target\release\is903burn-gui.exe'
 if (-not (Test-Path -LiteralPath $exe)) {

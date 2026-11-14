@@ -1,0 +1,68 @@
+# Maintainer: AIBurn <noreply@localhost>
+# 本地打包：./build-pacman.sh（直接 makepkg 会因默认 srcdir=./src 覆盖源码）
+# 产物：dist/is903burn-gui-<pkgver>-<pkgrel>-x86_64.pkg.tar.zst
+# 安装：sudo pacman -U dist/is903burn-gui-<pkgver>-<pkgrel>-x86_64.pkg.tar.zst
+# 源码直接取自本目录的 Git 工作树（未提交的改动也会进包）。
+
+pkgname=is903burn-gui
+pkgver=0.1.0
+pkgrel=2
+pkgdesc='把 ISO 或文件夹烧录到 Innostor IS903 虚拟光驱的图形界面'
+arch=('x86_64')
+url='https://github.com/billowsand/aiburn'
+license=('custom')
+depends=(
+  'glibc'
+  'libgcc'
+  # X11/Wayland/OpenGL 由 winit 与 glow 在运行时 dlopen，故仍需声明
+  'libglvnd'
+  'opengl-driver'
+  'wayland'
+  'libxkbcommon'
+  'libx11'
+  'libxcursor'
+  'libxi'
+  'libxrandr'
+  'fontconfig'
+  # 挂载/卸载 ISO 与提权访问 /dev/sgN
+  'udisks2'
+  'polkit'
+  'xdg-utils'
+  'xdg-desktop-portal'
+)
+optdepends=(
+  'noto-fonts-cjk: 中文界面字体'
+  'xdg-desktop-portal-gtk: 桌面门户不提供文件选择框时的 GTK 后备'
+)
+makedepends=('cargo' 'rust')
+options=('!debug' '!lto')
+source=()
+sha256sums=()
+
+build() {
+  # 复制工作树（剔除构建产物），在 $srcdir 内编译
+  mkdir -p "$srcdir/is903burn-gui"
+  tar -C "$startdir" \
+    --exclude=./target --exclude=./dist --exclude=./.git --exclude=./.idea \
+    -cf - . | tar -C "$srcdir/is903burn-gui" -xf -
+  cd "$srcdir/is903burn-gui"
+  # 把构建目录从二进制里抹掉（panic 位置等），否则 makepkg 会报告包内残留 $srcdir
+  export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=$srcdir=/build --remap-path-prefix=$startdir=/pkg"
+  cargo build --release --locked
+}
+
+check() {
+  cd "$srcdir/is903burn-gui"
+  export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=$srcdir=/build --remap-path-prefix=$startdir=/pkg"
+  cargo test --release --locked
+}
+
+package() {
+  cd "$srcdir/is903burn-gui"
+  install -Dm755 "${CARGO_TARGET_DIR:-target}/release/is903burn-gui" \
+    "$pkgdir/usr/bin/is903burn-gui"
+  install -Dm644 "$srcdir/is903burn-gui/is903burn-gui.desktop" \
+    "$pkgdir/usr/share/applications/is903burn-gui.desktop"
+  install -Dm644 "$srcdir/is903burn-gui/assets/is903burn-gui.png" \
+    "$pkgdir/usr/share/icons/hicolor/512x512/apps/is903burn-gui.png"
+}

@@ -10,6 +10,7 @@ mod iso;
 mod job;
 mod mount;
 mod sg;
+mod theme;
 #[cfg(target_os = "windows")]
 mod winapi;
 
@@ -56,12 +57,15 @@ fn main() -> eframe::Result<()> {
         }
     }
 
+    let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/is903burn-gui.png"))
+        .expect("embedded application icon must be a valid PNG");
     let opts = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
-            .with_inner_size([480.0, 560.0])
-            .with_min_inner_size([440.0, 520.0])
+            .with_inner_size([480.0, 320.0])
+            .with_min_inner_size([420.0, 280.0])
             .with_app_id("is903burn-gui")
             .with_title("IS903 烧录工具")
+            .with_icon(icon)
             // Windows 上拖放默认开启，这里显式声明，避免后端默认值变化后静默失效
             .with_drag_and_drop(true),
         ..Default::default()

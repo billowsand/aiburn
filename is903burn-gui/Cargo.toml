@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.95"
 description = "IS903 (UFCD) 烧录工具 — 图形界面"
+exclude = ["/dist"]
 
 [dependencies]
 # 只用 glow(OpenGL) 后端。eframe 的默认特性里包含 wgpu + DX12/着色器编译器，
@@ -34,6 +35,7 @@ strip = true
 
 [build-dependencies]
 cc = "1"
+embed-resource = "3"
 
 # 备选：切到 DX12 后端时取消下面的注释（同时把上面的 "glow" 换成
 # "wgpu_no_default_features"）。

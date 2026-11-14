@@ -1,7 +1,8 @@
 use crate::device::{self, Device};
 use crate::job::{self, Job, Msg};
+use crate::theme::Palette;
 use eframe::egui::{
-    self, Align, Align2, Color32, CornerRadius, FontId, Layout, RichText, Stroke, StrokeKind, Vec2,
+    self, Align, Align2, Color32, FontId, Layout, RichText, Stroke, StrokeKind, Vec2,
 };
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -10,78 +11,17 @@ use std::time::{Duration, Instant};
 const SCAN_INTERVAL: Duration = Duration::from_secs(5);
 /// 统计来源时最多遍历的条目数，超过就显示「以上」
 const SCAN_LIMIT: usize = 20_000;
-/// 成功状态用的绿色(只用于「已完成」)
-const OK: Color32 = Color32::from_rgb(0x2E, 0x7D, 0x4F);
+const CONTROL_HEIGHT: f32 = 28.0;
+const SOURCE_ROW_HEIGHT: f32 = 30.0;
+const SOURCE_ROW_GAP: f32 = 2.0;
+const BURN_BUTTON_WIDTH: f32 = 102.0;
+const CANCEL_BUTTON_WIDTH: f32 = 48.0;
+const VOLUME_COUNT_WIDTH: f32 = 36.0;
 
-// ------------------------------------------------------------------ 配色
-
-/// 正文：深棕，而不是纯黑
-const INK: Color32 = Color32::from_rgb(0x3A, 0x2C, 0x20);
-/// 强调色：棕
-const BROWN: Color32 = Color32::from_rgb(0x8B, 0x5E, 0x3C);
-/// 分隔线与描边
-const LINE: Color32 = Color32::from_rgb(0xDD, 0xD0, 0xC3);
-/// 面板里比白稍暗的底
-const SURFACE: Color32 = Color32::from_rgb(0xFA, 0xF6, 0xF2);
-/// 可交互控件默认底色
-const CONTROL: Color32 = Color32::from_rgb(0xF4, 0xEE, 0xE8);
-
-/// 固定白底 + 棕色强调色，不跟随系统深色模式（标题栏也跟着用浅色）
-fn apply_style(ctx: &egui::Context) {
-    // 只设 theme_preference 不够：首帧还来不及同步，标题栏会停在系统的深色，
-    // 所以再显式发一次 SetTheme（Windows 上会切回浅色标题栏）。
-    ctx.set_theme(egui::ThemePreference::Light);
-    ctx.send_viewport_cmd(egui::ViewportCommand::SetTheme(egui::SystemTheme::Light));
-    let mut v = egui::Visuals::light();
-    v.dark_mode = false;
-    v.panel_fill = Color32::WHITE;
-    v.window_fill = Color32::WHITE;
-    v.extreme_bg_color = SURFACE;
-    v.text_edit_bg_color = Some(Color32::WHITE);
-    v.faint_bg_color = CONTROL;
-    v.override_text_color = Some(INK);
-    v.weak_text_color = Some(Color32::from_rgb(0x83, 0x6D, 0x5A));
-    v.hyperlink_color = BROWN;
-    v.warn_fg_color = Color32::from_rgb(0xA8, 0x60, 0x0C);
-    v.error_fg_color = Color32::from_rgb(0xB0, 0x33, 0x25);
-    v.window_stroke = Stroke::new(1.0, LINE);
-    v.selection = egui::style::Selection {
-        bg_fill: Color32::from_rgb(0xEF, 0xE4, 0xD8),
-        stroke: Stroke::new(1.0, BROWN),
-    };
-
-    let w = &mut v.widgets;
-    w.noninteractive.bg_fill = SURFACE;
-    w.noninteractive.weak_bg_fill = SURFACE;
-    w.noninteractive.bg_stroke = Stroke::new(1.0, LINE);
-    w.noninteractive.fg_stroke = Stroke::new(1.0, INK);
-    w.noninteractive.corner_radius = CornerRadius::same(4);
-
-    w.inactive.bg_fill = CONTROL;
-    w.inactive.weak_bg_fill = CONTROL;
-    w.inactive.bg_stroke = Stroke::new(1.0, LINE);
-    w.inactive.fg_stroke = Stroke::new(1.0, INK);
-    w.inactive.corner_radius = CornerRadius::same(4);
-
-    w.hovered.bg_fill = Color32::from_rgb(0xEA, 0xDF, 0xD3);
-    w.hovered.weak_bg_fill = Color32::from_rgb(0xEA, 0xDF, 0xD3);
-    w.hovered.bg_stroke = Stroke::new(1.0, BROWN);
-    w.hovered.fg_stroke = Stroke::new(1.0, INK);
-    w.hovered.corner_radius = CornerRadius::same(4);
-
-    w.active.bg_fill = Color32::from_rgb(0xDF, 0xCF, 0xBE);
-    w.active.weak_bg_fill = Color32::from_rgb(0xDF, 0xCF, 0xBE);
-    w.active.bg_stroke = Stroke::new(1.0, BROWN);
-    w.active.fg_stroke = Stroke::new(1.0, INK);
-    w.active.corner_radius = CornerRadius::same(4);
-
-    w.open.bg_fill = Color32::from_rgb(0xEF, 0xE4, 0xD8);
-    w.open.weak_bg_fill = Color32::from_rgb(0xEF, 0xE4, 0xD8);
-    w.open.bg_stroke = Stroke::new(1.0, BROWN);
-    w.open.fg_stroke = Stroke::new(1.0, INK);
-    w.open.corner_radius = CornerRadius::same(4);
-
-    ctx.set_visuals(v);
+fn card(ui: &egui::Ui) -> egui::Frame {
+    egui::Frame::group(ui.style())
+        .fill(ui.visuals().window_fill)
+        .inner_margin(egui::Margin::same(10))
 }
 
 /// 一项待烧录来源
@@ -166,6 +106,9 @@ impl Source {
 }
 
 pub struct App {
+    palette: Palette,
+    #[cfg(target_os = "linux")]
+    last_theme_check: Instant,
     devices: Vec<Device>,
     selected: usize,
     sources: Vec<Source>,
@@ -188,9 +131,13 @@ pub struct App {
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, initial: Vec<PathBuf>) -> Self {
-        apply_style(&cc.egui_ctx);
+        let palette = Palette::current();
+        palette.apply(&cc.egui_ctx);
         install_fonts(&cc.egui_ctx);
         let mut app = Self {
+            palette,
+            #[cfg(target_os = "linux")]
+            last_theme_check: Instant::now(),
             devices: Vec::new(),
             selected: 0,
             sources: Vec::new(),
@@ -230,20 +177,6 @@ impl App {
             && self.current().is_some()
             && self.access_error.is_none()
             && !self.sources.is_empty()
-    }
-
-    fn hint(&self) -> Option<&'static str> {
-        if self.devices.is_empty() {
-            return Some("未检测到设备，请连接 IS903 后点「刷新」");
-        }
-        if self.access_error.is_some() {
-            // 设备区域里已经有具体原因，这里不再重复
-            return None;
-        }
-        if self.sources.is_empty() {
-            return Some("文件夹内容会放到光盘根目录");
-        }
-        None
     }
 
     fn total_bytes(&self) -> u64 {
@@ -383,85 +316,70 @@ impl App {
 
     // -------------------------------------------------------------- 界面
 
-    fn header_ui(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("IS903 烧录工具").size(16.0).strong());
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let (text, color) = self.status(ui);
-                ui.label(RichText::new(text).color(color));
-            });
-        });
-    }
-
-    fn status(&self, ui: &egui::Ui) -> (&'static str, Color32) {
-        let visuals = ui.visuals();
-        if self.busy() {
-            return ("烧录中…", visuals.text_color());
-        }
-        match &self.result {
-            Some(Ok(_)) => ("已完成", OK),
-            Some(Err(error)) if error.starts_with("已取消") => {
-                ("已取消", visuals.weak_text_color())
-            }
-            Some(Err(_)) => ("失败", visuals.error_fg_color),
-            None if self.devices.is_empty() => ("未连接", visuals.weak_text_color()),
-            None if self.access_error.is_some() => ("未就绪", visuals.warn_fg_color),
-            None => ("就绪", visuals.text_color()),
-        }
-    }
-
     fn device_ui(&mut self, ui: &mut egui::Ui) {
         let mut refresh = false;
         let mut changed = false;
         let enabled = !self.busy();
-        let title = self
-            .current()
-            .map(Device::title)
-            .unwrap_or_else(|| "选择设备".into());
+        let title = self.current().map(Device::title);
         let devices = &self.devices;
         let selected = &mut self.selected;
 
-        egui::Frame::group(ui.style()).show(ui, |ui| {
-            ui.set_width(ui.available_width());
+        card(ui).show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label("设备");
-                if devices.is_empty() {
-                    ui.label(
-                        RichText::new("未检测到 IS903 设备，请确认已插入").color(
-                            ui.visuals().warn_fg_color,
-                        ),
-                    );
-                } else {
-                    let width = (ui.available_width() - 76.0).max(90.0);
-                    ui.add_enabled_ui(enabled, |ui| {
-                        egui::ComboBox::from_id_salt("device")
-                            .width(width)
-                            .selected_text(title)
-                            .show_ui(ui, |ui| {
-                                for (index, device) in devices.iter().enumerate() {
-                                    if ui
-                                        .selectable_label(*selected == index, device.title())
-                                        .clicked()
-                                    {
-                                        *selected = index;
-                                        changed = true;
-                                    }
-                                }
+                ui.label(RichText::new("目标设备").size(14.0).strong());
+                let refresh_width = 54.0;
+                let field_width =
+                    (ui.available_width() - refresh_width - ui.spacing().item_spacing.x).max(0.0);
+                ui.allocate_ui_with_layout(
+                    Vec2::new(field_width, CONTROL_HEIGHT),
+                    Layout::left_to_right(Align::Center),
+                    |ui| {
+                        ui.set_min_size(Vec2::new(field_width, CONTROL_HEIGHT));
+                        if let Some(title) = title {
+                            ui.add_enabled_ui(enabled, |ui| {
+                                egui::ComboBox::from_id_salt("device")
+                                    .width(field_width)
+                                    .truncate()
+                                    .selected_text(&title)
+                                    .show_ui(ui, |ui| {
+                                        for (index, device) in devices.iter().enumerate() {
+                                            let title = device.title();
+                                            if ui
+                                                .add(
+                                                    egui::Button::selectable(
+                                                        *selected == index,
+                                                        &title,
+                                                    )
+                                                    .truncate(),
+                                                )
+                                                .on_hover_text(title)
+                                                .clicked()
+                                            {
+                                                *selected = index;
+                                                changed = true;
+                                            }
+                                        }
+                                    })
+                                    .response
+                                    .on_hover_text(title);
                             });
-                    });
-                }
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui.add_enabled(enabled, egui::Button::new("刷新")).clicked() {
-                        refresh = true;
-                    }
-                });
+                        } else {
+                            ui.label(RichText::new("未检测到 IS903 设备").weak())
+                                .on_hover_text("连接 IS903 后可点击「刷新」");
+                        }
+                    },
+                );
+                refresh = ui
+                    .add_enabled(
+                        enabled,
+                        egui::Button::new("刷新")
+                            .min_size(Vec2::new(refresh_width, CONTROL_HEIGHT)),
+                    )
+                    .clicked();
             });
             if let Some(error) = &self.access_error {
                 ui.add(
-                    egui::Label::new(
-                        RichText::new(error).color(ui.visuals().warn_fg_color),
-                    )
-                    .wrap(),
+                    egui::Label::new(RichText::new(error).color(ui.visuals().warn_fg_color)).wrap(),
                 );
             }
         });
@@ -474,121 +392,126 @@ impl App {
         }
     }
 
-    fn sources_ui(&mut self, ui: &mut egui::Ui) {
+    fn sources_ui(&mut self, ui: &mut egui::Ui, list_height: f32) {
         let mut pick_files = false;
         let mut pick_folder = false;
-        let dragging = ui.ctx().input(|i| !i.raw.hovered_files.is_empty());
         let busy = self.busy();
         let mut remove = None;
 
-        egui::Frame::group(ui.style()).show(ui, |ui| {
-            ui.set_width(ui.available_width());
+        card(ui).show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label("内容");
+                ui.label(RichText::new("烧录内容").size(14.0).strong());
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui.add_enabled(!busy, egui::Button::new("添加文件夹")).clicked() {
-                        pick_folder = true;
-                    }
-                    if ui.add_enabled(!busy, egui::Button::new("添加文件")).clicked() {
-                        pick_files = true;
-                    }
+                    pick_folder = ui
+                        .add_enabled(!busy, egui::Button::new("添加文件夹"))
+                        .on_hover_text("文件夹内容会放到光盘根目录")
+                        .clicked();
+                    pick_files = ui
+                        .add_enabled(!busy, egui::Button::new("添加文件"))
+                        .clicked();
                 });
             });
 
-            let list_height = (ui.available_height() - 26.0).max(56.0);
-            let bg = Color32::WHITE;
-            let weak = ui.visuals().weak_text_color();
-            let accent = ui.visuals().selection.stroke.color;
-
+            let visuals = ui.visuals();
+            let line = visuals.widgets.noninteractive.bg_stroke;
+            let radius = visuals.widgets.noninteractive.corner_radius;
+            let muted_fill = visuals.faint_bg_color;
             if self.sources.is_empty() {
                 let (rect, response) = ui.allocate_exact_size(
-                    Vec2::new(ui.available_width(), list_height),
-                    egui::Sense::click(),
+                    Vec2::new(ui.available_width(), 58.0),
+                    if busy {
+                        egui::Sense::hover()
+                    } else {
+                        egui::Sense::click()
+                    },
                 );
-                let painter = ui.painter();
-                painter.rect_filled(rect, 2.0, bg);
-                painter.rect_stroke(
+                let accent = ui.visuals().selection.stroke.color;
+                let hovered = response.hovered() && !busy;
+                ui.painter().rect(
                     rect,
-                    2.0,
-                    Stroke::new(
-                        1.0,
-                        if dragging {
-                            accent
-                        } else {
-                            ui.visuals().widgets.inactive.bg_stroke.color
-                        },
-                    ),
+                    radius,
+                    muted_fill,
+                    if hovered {
+                        Stroke::new(1.0, accent)
+                    } else {
+                        line
+                    },
                     StrokeKind::Inside,
                 );
-                painter.text(
+                ui.painter().text(
                     rect.center(),
                     Align2::CENTER_CENTER,
-                    "拖入文件或文件夹，或点「添加文件」",
-                    FontId::proportional(12.5),
-                    weak,
+                    "拖入文件或文件夹",
+                    FontId::proportional(13.0),
+                    ui.visuals().weak_text_color(),
                 );
-                if response.clicked() && !busy {
-                    pick_files = true;
-                }
+                pick_files |= response.clicked();
+                response.on_hover_cursor(egui::CursorIcon::PointingHand);
             } else {
-                egui::Frame::new()
-                    .fill(bg)
-                    .inner_margin(egui::Margin::same(4))
-                    .show(ui, |ui| {
-                        egui::ScrollArea::vertical()
-                            .id_salt("sources")
-                            .max_height(list_height - 8.0)
-                            .min_scrolled_height(list_height - 8.0)
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| {
-                                ui.set_width(ui.available_width());
-                                ui.spacing_mut().item_spacing.y = 2.0;
-                                for (index, source) in self.sources.iter().enumerate() {
-                                    if source_row(ui, source) {
+                ui.scope(|ui| {
+                    ui.spacing_mut().item_spacing.y = SOURCE_ROW_GAP;
+                    let content_height = (SOURCE_ROW_HEIGHT + SOURCE_ROW_GAP)
+                        * self.sources.len() as f32
+                        - SOURCE_ROW_GAP;
+                    let scrollbar = if content_height > list_height {
+                        egui::scroll_area::ScrollBarVisibility::AlwaysVisible
+                    } else {
+                        egui::scroll_area::ScrollBarVisibility::AlwaysHidden
+                    };
+                    ui.spacing_mut().scroll.floating = false;
+                    egui::ScrollArea::vertical()
+                        .id_salt("sources")
+                        .max_height(list_height)
+                        .min_scrolled_height(0.0)
+                        .scroll_bar_visibility(scrollbar)
+                        .auto_shrink([false, true])
+                        .show_rows(ui, SOURCE_ROW_HEIGHT, self.sources.len(), |ui, rows| {
+                            for index in rows {
+                                ui.push_id(index, |ui| {
+                                    if source_row(ui, &self.sources[index], busy, index > 0) {
                                         remove = Some(index);
                                     }
-                                }
-                            });
+                                });
+                            }
+                        });
+                });
+
+                let total = self.total_bytes();
+                let count = if self.sources.iter().any(|s| s.capped) {
+                    " 以上"
+                } else {
+                    ""
+                };
+                let summary = format!(
+                    "{} 个来源 · {} 个文件{count} · {}",
+                    self.sources.len(),
+                    self.total_files(),
+                    device::human_size(total)
+                );
+                egui::Frame::new()
+                    .fill(muted_fill)
+                    .corner_radius(radius)
+                    .inner_margin(egui::Margin::symmetric(8, 4))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.set_min_width(ui.available_width());
+                            ui.label(RichText::new(summary).size(12.0).weak());
+                            let capacity = self.current().map_or(0, |d| d.capacity);
+                            if capacity > 0 {
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    let size = device::human_size(capacity);
+                                    let text = if total > capacity {
+                                        RichText::new(format!("超出光盘容量 {size}"))
+                                            .color(ui.visuals().error_fg_color)
+                                    } else {
+                                        RichText::new(format!("光盘可用 {size}")).weak()
+                                    };
+                                    ui.add(egui::Label::new(text.size(12.0)).truncate());
+                                });
+                            }
+                        });
                     });
             }
-
-            ui.horizontal(|ui| {
-                let total = self.total_bytes();
-                let text = if self.sources.is_empty() {
-                    "尚未添加内容".to_owned()
-                } else {
-                    format!(
-                        "{} 个来源 · {} 个文件 · {}",
-                        self.sources.len(),
-                        self.total_files(),
-                        device::human_size(total)
-                    )
-                };
-                ui.label(RichText::new(text).color(weak));
-                let capacity = self.current().map(|d| d.capacity).unwrap_or(0);
-                if self.sources.is_empty() || capacity == 0 {
-                    return;
-                }
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if total > capacity {
-                        ui.label(
-                            RichText::new(format!(
-                                "超出光盘容量 {}",
-                                device::human_size(capacity)
-                            ))
-                            .color(ui.visuals().error_fg_color),
-                        );
-                    } else {
-                        ui.label(
-                            RichText::new(format!(
-                                "光盘可用 {}",
-                                device::human_size(capacity)
-                            ))
-                            .color(weak),
-                        );
-                    }
-                });
-            });
         });
 
         if let Some(index) = remove {
@@ -617,41 +540,42 @@ impl App {
         let busy = self.busy();
         let ready = self.ready();
 
-        egui::Frame::group(ui.style()).show(ui, |ui| {
-            ui.set_width(ui.available_width());
+        card(ui).show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label("卷标");
-                let width = (ui.available_width() - 44.0).max(60.0);
+                ui.label(RichText::new("卷标").size(14.0).strong());
+                let gap = ui.spacing().item_spacing.x;
+                let cancel_width = if busy { CANCEL_BUTTON_WIDTH + gap } else { 0.0 };
+                let input_width = (ui.available_width()
+                    - BURN_BUTTON_WIDTH - cancel_width - VOLUME_COUNT_WIDTH - 2.0 * gap)
+                    .clamp(24.0, 320.0);
                 let response = ui.add_enabled(
                     !busy,
                     egui::TextEdit::singleline(&mut self.label)
                         .char_limit(16)
-                        .desired_width(width),
+                        .desired_width(input_width)
+                        .min_size(Vec2::new(0.0, CONTROL_HEIGHT))
+                        .margin(egui::Margin::symmetric(8, 4)),
                 );
                 if response.changed() {
                     self.label_edited = true;
                 }
-                ui.label(
-                    RichText::new(format!("{}/16", self.label.chars().count()))
-                        .color(ui.visuals().weak_text_color()),
-                );
-            });
-
-            ui.horizontal(|ui| {
-                let caption = if busy { "烧录进行中…" } else { "开始烧录" };
-                if ui
-                    .add_enabled(
-                        ready,
+                ui.label(RichText::new(format!("{}/16", self.label.chars().count())).size(12.0).weak());
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if busy {
+                        cancel = ui
+                            .add(egui::Button::new("取消").min_size(Vec2::new(CANCEL_BUTTON_WIDTH, CONTROL_HEIGHT)))
+                            .clicked();
+                    }
+                    let caption = if busy { "烧录进行中…" } else { "开始烧录" };
+                    let button = if ready {
+                        self.palette.primary_button(caption)
+                    } else {
                         egui::Button::new(RichText::new(caption).strong())
-                            .min_size(Vec2::new(110.0, 30.0)),
-                    )
-                    .clicked()
-                {
-                    start = true;
-                }
-                if busy && ui.button("取消").clicked() {
-                    cancel = true;
-                }
+                    };
+                    start = ui
+                        .add_enabled(ready, button.min_size(Vec2::new(BURN_BUTTON_WIDTH, CONTROL_HEIGHT)))
+                        .clicked();
+                });
             });
 
             // 状态
@@ -675,14 +599,14 @@ impl App {
                 ui.add(
                     egui::ProgressBar::new(self.progress)
                         .desired_height(10.0)
-                        .fill(BROWN)
+                        .fill(self.palette.accent)
                         .corner_radius(2.0),
                 );
             } else if let Some(result) = &self.result {
                 match result {
                     Ok(ok) => {
                         ui.horizontal(|ui| {
-                            ui.label(RichText::new("烧录完成").strong().color(OK));
+                            ui.label(RichText::new("烧录完成").strong().color(self.palette.success));
                             ui.label(
                                 RichText::new(format!(
                                     "{} 个文件 · {} · {:.1} 秒",
@@ -730,8 +654,6 @@ impl App {
                         });
                     }
                 }
-            } else if let Some(hint) = self.hint() {
-                ui.label(RichText::new(hint).color(ui.visuals().weak_text_color()));
             }
 
             if let Some(notice) = &self.notice {
@@ -806,7 +728,9 @@ impl App {
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         for line in &self.log {
-                            ui.add(egui::Label::new(RichText::new(line.clone()).monospace()).wrap());
+                            ui.add(
+                                egui::Label::new(RichText::new(line.clone()).monospace()).wrap(),
+                            );
                         }
                     });
             });
@@ -855,7 +779,7 @@ impl App {
                 if ui
                     .add_sized(
                         Vec2::new(width, 30.0),
-                        egui::Button::new(RichText::new("确认烧录").strong()),
+                        self.palette.primary_button("确认烧录"),
                     )
                     .clicked()
                     && armed
@@ -906,13 +830,26 @@ impl App {
 }
 
 impl eframe::App for App {
-    /// 白底：透明处和窗口缩放时不会露出深色默认底色
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        Color32::WHITE.to_normalized_gamma_f32()
+        self.palette.background.to_normalized_gamma_f32()
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        #[cfg(target_os = "linux")]
+        {
+            const THEME_CHECK_INTERVAL: Duration = Duration::from_secs(2);
+            if self.last_theme_check.elapsed() >= THEME_CHECK_INTERVAL {
+                self.last_theme_check = Instant::now();
+                let palette = Palette::current();
+                if palette != self.palette {
+                    self.palette = palette;
+                    palette.apply(&ctx);
+                    ui.set_style(ctx.global_style());
+                }
+            }
+            ctx.request_repaint_after(THEME_CHECK_INTERVAL);
+        }
         self.poll_job(&ctx);
         let busy = self.busy();
 
@@ -956,25 +893,28 @@ impl eframe::App for App {
             }
         }
 
-        let margin = egui::Margin::symmetric(10, 8);
-        let panel = egui::Frame::new()
-            .fill(Color32::WHITE)
-            .inner_margin(margin);
-        egui::Panel::top("header")
-            .resizable(false)
-            .frame(panel)
-            .show(ui, |ui| self.header_ui(ui));
-        egui::Panel::top("device")
-            .resizable(false)
-            .frame(panel)
-            .show(ui, |ui| self.device_ui(ui));
-        egui::Panel::bottom("footer")
-            .resizable(false)
-            .frame(panel)
-            .show(ui, |ui| self.footer_ui(ui));
+        // 给设备、列表工具栏、统计和卷标预留高度。长提示允许整页滚动。
+        let row_step = SOURCE_ROW_HEIGHT + SOURCE_ROW_GAP;
+        let visible_rows = ((ui.available_height() - 244.0) / row_step)
+            .floor()
+            .clamp(1.0, 7.0);
+        let list_height = visible_rows * row_step - SOURCE_ROW_GAP;
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(Color32::WHITE).inner_margin(margin))
-            .show(ui, |ui| self.sources_ui(ui));
+            .frame(
+                egui::Frame::new()
+                    .fill(self.palette.background)
+                    .inner_margin(12),
+            )
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("main")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        self.device_ui(ui);
+                        self.sources_ui(ui, list_height);
+                        self.footer_ui(ui);
+                    });
+            });
 
         self.confirm_ui(&ctx);
         self.log_window(&ctx);
@@ -982,30 +922,70 @@ impl eframe::App for App {
     }
 }
 
-/// 一行来源: 名称 + 大小 + 移除
-fn source_row(ui: &mut egui::Ui, source: &Source) -> bool {
-    let mut remove = false;
-    ui.horizontal(|ui| {
-        let name_width = (ui.available_width() - 150.0).max(48.0);
-        ui.allocate_ui_with_layout(
-            Vec2::new(name_width, 18.0),
-            Layout::left_to_right(Align::Center),
-            |ui| {
-                ui.add(egui::Label::new(source.name()).truncate())
-                    .on_hover_text(source.path.display().to_string());
-            },
-        );
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            remove = ui
-                .add(egui::Button::new("×").frame(false))
+fn source_row(ui: &mut egui::Ui, source: &Source, busy: bool, divider: bool) -> bool {
+    let width = ui.available_width();
+    let row = ui.allocate_ui_with_layout(
+        Vec2::new(width, SOURCE_ROW_HEIGHT),
+        Layout::right_to_left(Align::Center),
+        |ui| {
+            let remove = ui
+                .add_enabled(
+                    !busy,
+                    egui::Button::new("×")
+                        .frame(false)
+                        .min_size(Vec2::splat(26.0)),
+                )
                 .on_hover_text("从列表移除")
                 .clicked();
-            ui.label(
-                RichText::new(source.detail()).color(ui.visuals().weak_text_color()),
-            );
-        });
-    });
-    remove
+            ui.add(egui::Label::new(RichText::new(source.detail()).size(12.0).weak()).truncate());
+            ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                let (rect, _) = ui.allocate_exact_size(Vec2::splat(16.0), egui::Sense::hover());
+                source_icon(ui, rect, source.is_dir);
+                ui.add(egui::Label::new(source.name()).truncate())
+                    .on_hover_text(source.path.display().to_string());
+            });
+            remove
+        },
+    );
+    if divider {
+        let rect = row.response.rect;
+        ui.painter().hline(
+            rect.x_range(),
+            rect.top(),
+            ui.visuals().widgets.noninteractive.bg_stroke,
+        );
+    }
+    row.inner
+}
+
+fn source_icon(ui: &egui::Ui, rect: egui::Rect, folder: bool) {
+    let point = |x, y| rect.min + Vec2::new(x, y);
+    let stroke = Stroke::new(1.25, ui.visuals().hyperlink_color);
+    let outline = if folder {
+        vec![
+            point(1.5, 4.0),
+            point(6.0, 4.0),
+            point(8.0, 6.0),
+            point(14.5, 6.0),
+            point(14.5, 13.0),
+            point(1.5, 13.0),
+        ]
+    } else {
+        vec![
+            point(3.0, 1.5),
+            point(9.0, 1.5),
+            point(13.0, 5.5),
+            point(13.0, 14.5),
+            point(3.0, 14.5),
+        ]
+    };
+    ui.painter().add(egui::Shape::closed_line(outline, stroke));
+    if !folder {
+        ui.painter().add(egui::Shape::line(
+            vec![point(9.0, 1.5), point(9.0, 5.5), point(13.0, 5.5)],
+            stroke,
+        ));
+    }
 }
 
 /// 用系统的文件管理器打开目录
