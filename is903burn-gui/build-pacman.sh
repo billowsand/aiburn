@@ -9,6 +9,7 @@ cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
 
 export BUILDDIR="${BUILDDIR:-$PWD/dist/build}"
 export PKGDEST="${PKGDEST:-$PWD/dist}"
+export PACKAGER="${PACKAGER:-sysphus <3699403+billowsand@users.noreply.github.com>}"
 mkdir -p "$BUILDDIR" "$PKGDEST"
 
 # cargo/rust 由 rustup 提供、不经 pacman 管理，跳过 makedepends 检查。

@@ -141,15 +141,20 @@ jobs:
         env:
           VERSION: ${{ needs.prepare.outputs.version }}
         run: |
-          .\is903burn-gui\build-windows.ps1 -Portable
+          $ErrorActionPreference = 'Stop'
+          $root = $env:GITHUB_WORKSPACE
+          & "$root\is903burn-gui\build-windows.ps1" -Portable
+          if ($LASTEXITCODE -ne 0) { throw "build-windows.ps1 failed with exit code $LASTEXITCODE" }
           choco install innosetup --no-progress -y
+          Set-Location $root
           $iscc = Get-ChildItem 'C:\Program Files*\Inno Setup*\ISCC.exe' |
             Select-Object -First 1 -ExpandProperty FullName
           if (-not $iscc) { throw 'ISCC.exe not found' }
-          & $iscc "/DAppVersion=$env:VERSION" "is903burn-gui\installer.iss"
+          & $iscc "/DAppVersion=$env:VERSION" "$root\is903burn-gui\installer.iss"
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }
           Move-Item -Force `
-            "is903burn-gui\dist\is903burn-gui-windows-x64.zip" `
-            "is903burn-gui\dist\is903burn-gui-$env:VERSION-windows-x64-portable.zip"
+            "$root\is903burn-gui\dist\is903burn-gui-windows-x64.zip" `
+            "$root\is903burn-gui\dist\is903burn-gui-$env:VERSION-windows-x64-portable.zip"
       - uses: actions/upload-artifact@v4
         with:
           name: windows-x64
