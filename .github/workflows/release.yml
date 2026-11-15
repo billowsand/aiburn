@@ -1,0 +1,216 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: meta
+        run: |
+          if [[ $GITHUB_REF_TYPE == tag ]]; then
+            tag=$GITHUB_REF_NAME
+          else
+            version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' is903burn-gui/Cargo.toml | head -n1)
+            tag=v$version
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+
+  linux-x86_64:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build in Ubuntu 20.04
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          mkdir -p is903burn-gui/dist
+          docker run --rm --platform linux/amd64 \
+            -v "$GITHUB_WORKSPACE:/src:ro" \
+            -v "$GITHUB_WORKSPACE/is903burn-gui/dist:/out" \
+            -e VERSION -e DEBIAN_FRONTEND=noninteractive \
+            ubuntu:20.04 bash -euxo pipefail -c '
+              apt-get update
+              apt-get install -y --no-install-recommends \
+                build-essential ca-certificates curl pkg-config
+              curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs |
+                sh -s -- -y --profile minimal --default-toolchain stable
+              . "$HOME/.cargo/env"
+              cp -a /src /build
+              cd /build/is903burn-gui
+              ./package-linux.sh amd64
+              cp dist/*.deb dist/*.tar.gz /out/
+            '
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-x86_64
+          path: |
+            is903burn-gui/dist/*.deb
+            is903burn-gui/dist/*.tar.gz
+          if-no-files-found: error
+
+  linux-aarch64:
+    needs: prepare
+    # ARM64 托管 runner 上运行 Ubuntu 20.04 容器，产物以 glibc 2.31 为基线。
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build in Ubuntu 20.04 (arm64)
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          mkdir -p is903burn-gui/dist
+          docker run --rm --platform linux/arm64 \
+            -v "$GITHUB_WORKSPACE:/src:ro" \
+            -v "$GITHUB_WORKSPACE/is903burn-gui/dist:/out" \
+            -e VERSION -e DEBIAN_FRONTEND=noninteractive \
+            ubuntu:20.04 bash -euxo pipefail -c '
+              apt-get update
+              apt-get install -y --no-install-recommends \
+                build-essential ca-certificates curl pkg-config
+              curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs |
+                sh -s -- -y --profile minimal --default-toolchain stable
+              . "$HOME/.cargo/env"
+              cp -a /src /build
+              cd /build/is903burn-gui
+              ./package-linux.sh arm64
+              cp dist/*.deb dist/*.tar.gz /out/
+            '
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-aarch64
+          path: |
+            is903burn-gui/dist/*.deb
+            is903burn-gui/dist/*.tar.gz
+          if-no-files-found: error
+
+  pacman:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Arch package
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          mkdir -p is903burn-gui/dist
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/src:ro" \
+            -v "$GITHUB_WORKSPACE/is903burn-gui/dist:/out" \
+            -e VERSION \
+            archlinux:base-devel bash -euxo pipefail -c '
+              pacman -Syu --noconfirm --needed rust
+              useradd -m builder
+              cp -a /src /build
+              sed -i "s/^pkgver=.*/pkgver=$VERSION/; s/^pkgrel=.*/pkgrel=1/" \
+                /build/is903burn-gui/PKGBUILD
+              chown -R builder /build
+              su builder -c "cd /build/is903burn-gui && ./build-pacman.sh"
+              cp /build/is903burn-gui/dist/*.pkg.tar.zst /out/
+            '
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pacman
+          path: is903burn-gui/dist/*.pkg.tar.zst
+          if-no-files-found: error
+
+  windows-x64:
+    needs: prepare
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build portable and installer
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          .\is903burn-gui\build-windows.ps1 -Portable
+          choco install innosetup --no-progress -y
+          $iscc = Get-ChildItem 'C:\Program Files*\Inno Setup*\ISCC.exe' |
+            Select-Object -First 1 -ExpandProperty FullName
+          if (-not $iscc) { throw 'ISCC.exe not found' }
+          & $iscc "/DAppVersion=$env:VERSION" "is903burn-gui\installer.iss"
+          Move-Item -Force `
+            "is903burn-gui\dist\is903burn-gui-windows-x64.zip" `
+            "is903burn-gui\dist\is903burn-gui-$env:VERSION-windows-x64-portable.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64
+          path: |
+            is903burn-gui/dist/*.exe
+            is903burn-gui/dist/*.zip
+          if-no-files-found: error
+
+  macos-universal:
+    needs: prepare
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - name: Build universal DMG
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: ./is903burn-gui/package-macos.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-universal
+          path: is903burn-gui/dist/*.dmg
+          if-no-files-found: error
+
+  release:
+    needs:
+      - prepare
+      - linux-x86_64
+      - linux-aarch64
+      - pacman
+      - windows-x64
+      - macos-universal
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Generate checksums
+        run: |
+          cd artifacts
+          sha256sum *.dmg *.deb *.tar.gz *.pkg.tar.zst *.exe *.zip > SHA256SUMS
+          cat SHA256SUMS
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" artifacts/* --clobber
+          else
+            if [[ -f ".github/release-notes/$TAG.md" ]]; then
+              notes=(--notes-file ".github/release-notes/$TAG.md")
+            else
+              notes=(--generate-notes)
+            fi
+            gh release create "$TAG" artifacts/* \
+              --title "IS903 Burner ${TAG#v}" \
+              "${notes[@]}"
+          fi

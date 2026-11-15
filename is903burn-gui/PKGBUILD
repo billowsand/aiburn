@@ -1,4 +1,4 @@
-# Maintainer: AIBurn <noreply@localhost>
+# Maintainer: sysphus <3699403+billowsand@users.noreply.github.com>
 # 本地打包：./build-pacman.sh（直接 makepkg 会因默认 srcdir=./src 覆盖源码）
 # 产物：dist/is903burn-gui-<pkgver>-<pkgrel>-x86_64.pkg.tar.zst
 # 安装：sudo pacman -U dist/is903burn-gui-<pkgver>-<pkgrel>-x86_64.pkg.tar.zst
@@ -6,7 +6,7 @@
 
 pkgname=is903burn-gui
 pkgver=0.1.0
-pkgrel=2
+pkgrel=1
 pkgdesc='把 ISO 或文件夹烧录到 Innostor IS903 虚拟光驱的图形界面'
 arch=('x86_64')
 url='https://github.com/billowsand/aiburn'

@@ -5,6 +5,23 @@ Innostar IS903 "USB Flash CD-ROM" (UFCD) chip using vendor SCSI commands.
 `is903burn` is a native Linux reimplementation of that protocol, speaking
 `SG_IO` directly to `/dev/sg0`.
 
+## 下载与安装
+
+发布包由 GitHub Actions 构建，从 [Releases](https://github.com/billowsand/aiburn/releases) 下载：
+
+| 平台 | 架构 | 文件 | 安装 |
+| --- | --- | --- | --- |
+| macOS 11+ | Universal（arm64 + x86_64） | `is903burn-gui-<version>-macos-universal.dmg` | 拖入 Applications；已内置 libusb |
+| Linux | x86_64 | `is903burn-gui_<version>_amd64.deb` | `sudo apt install ./<文件>` |
+| Linux | x86_64 | `is903burn-gui-<version>-linux-x86_64.tar.gz` | 解压即用 |
+| Linux | arm64 | `is903burn-gui_<version>_arm64.deb` | 在 Ubuntu 20.04 arm64 上构建，glibc 2.31 基线 |
+| Arch Linux | x86_64 | `is903burn-gui-<version>-1-x86_64.pkg.tar.zst` | `sudo pacman -U <文件>` |
+| Windows 10/11 | x64 | `is903burn-gui-<version>-windows-x64-setup.exe` | 安装包，无需管理员权限 |
+| Windows 10/11 | x64 | `is903burn-gui-<version>-windows-x64-portable.zip` | 单个 exe，解压即用 |
+
+macOS 包没有 Apple 开发者签名，首次启动请右键点击 App →「打开」。安装包不包含遥测或联网功能；
+`SHA256SUMS` 随每个 Release 发布。
+
 ## 桌面程序（Linux、macOS 和 Windows）
 
 `is903burn-gui` 在三个平台使用相同的 GUI、CLI 和 ISO 生成器，支持 ISO 9660 + Joliet 和中文文件名。以下命令从仓库根目录运行。构建需要 Rust 1.95 或更新版本。
@@ -20,6 +37,16 @@ Innostar IS903 "USB Flash CD-ROM" (UFCD) chip using vendor SCSI commands.
 - **Windows** 构建会把多尺寸图标内嵌到 `is903burn-gui.exe`，使用 MSVC 工具链随附的 Windows SDK 资源编译器。
 - **macOS** 构建同时生成 `is903burn-gui/target/release/IS903 Burner.app`。从 Finder 打开应用包，或运行 `open 'is903burn-gui/target/release/IS903 Burner.app'`，即可在 Finder 和 Dock 中使用新图标。原始可执行文件继续用于命令行。
 - **Linux** 启动器从 `hicolor` 主题加载图标。Arch Linux 可运行 `./is903burn-gui/build-pacman.sh` 打包，再用 `pacman -U` 安装生成的包。手动安装时，将程序、`.desktop` 文件和 `is903burn-gui/assets/is903burn-gui.png` 分别安装到 `/usr/bin`、`/usr/share/applications` 和 `/usr/share/icons/hicolor/512x512/apps`。
+
+发布包由 `.github/workflows/release.yml` 在推送 `v*` 标签时构建。本地也可以运行同样的打包脚本：
+
+```sh
+./is903burn-gui/package-linux.sh amd64   # 生成 .deb 与 .tar.gz（在 Ubuntu 20.04 上构建可兼容 20.04+）
+./is903burn-gui/package-macos.sh         # 生成内置 libusb 的 Universal .dmg
+powershell -ExecutionPolicy Bypass -File .\is903burn-gui\build-windows.ps1 -Portable
+```
+
+Windows 安装包需要安装 Inno Setup 6，然后用版本号编译 `is903burn-gui/installer.iss`。
 
 ```sh
 ./is903burn-gui/target/release/is903burn-gui            # 启动 GUI
